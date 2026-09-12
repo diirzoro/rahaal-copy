@@ -2398,6 +2398,9 @@ async function handleRoute(request, { params }) {
         const tid = tenantIdMatch[1]
         if (method === 'PATCH') {
           const b = await request.json()
+          // v4.9 — CRUD Tenants: fine-grained enforcement (admin_staff needs offices.edit)
+          const canT = await adminCan(db, sess)
+          if (!canT.has('offices', 'edit')) return bad('غير مصرح — تعديل المكاتب يتطلب صلاحية Edit', 403)
           // v4.0 — «زيادة حصة القيود» has exactly ONE path: POST /admin/tenants/:id/topup.
           // The old dual PATCH top_up_amount path is retired to prevent double-logging.
           if (b.top_up_amount !== undefined) return bad('زيادة حصة القيود لها مسار مخصص واحد — استخدم زر «زيادة حصة القيود»')
@@ -2456,11 +2459,9 @@ async function handleRoute(request, { params }) {
           return ok({ success: true })
         }
         if (method === 'DELETE') {
-          await db.collection('tenants').deleteOne({ id: tid })
-          for (const c of ['users', 'accounts', 'boxes', 'clients', 'suppliers', 'tickets', 'visas', 'services', 'service_types', 'vouchers', 'journal_entries', 'tenant_settings', 'currency_exchanges']) {
-            await db.collection(c).deleteMany({ tenant_id: tid })
-          }
-          return ok({ success: true })
+          // v4.9 — CRUD Tenants: the legacy hard cascade delete is BLOCKED. A safe delete
+          // (soft-delete/archive) requires an explicit design decision. No data is removed.
+          return bad('⛔ الحذف الصلب للمكتب غير متاح — يتطلب قرار تصميم (حذف ناعم / أرشيف). استخدم التعليق (Suspend) بدلاً منه. لم تُحذف أي بيانات.', 403)
         }
       }
 
@@ -2468,6 +2469,9 @@ async function handleRoute(request, { params }) {
       const toggleMatch = route.match(/^\/admin\/tenants\/([^/]+)\/toggle-status$/)
       if (toggleMatch && method === 'POST') {
         const tid = toggleMatch[1]
+        // v4.9 — CRUD Tenants: fine-grained enforcement (admin_staff needs offices.manage)
+        const canTg = await adminCan(db, sess)
+        if (!canTg.has('offices', 'manage')) return bad('غير مصرح — تعليق/تفعيل المكتب يتطلب صلاحية Manage', 403)
         const t = await db.collection('tenants').findOne({ id: tid })
         if (!t) return bad('المكتب غير موجود', 404)
         const newStatus = t.status === 'suspended' ? 'active' : 'suspended'
