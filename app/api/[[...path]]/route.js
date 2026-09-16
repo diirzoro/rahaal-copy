@@ -21,12 +21,12 @@ import { adminNotifyHandler } from '@/lib/adminNotify' // v3.95 — Batch 3 (In-
 import { adminReportsHandler } from '@/lib/adminReports' // v3.96 — Batch 4 (Reports — READ-ONLY)
 import { adminDisputesHandler } from '@/lib/adminDisputes' // v3.96 — Batch 4 (Disputes)
 import { adminCurrencyHandler } from '@/lib/adminCurrency' // v3.96 — Batch 4 (Currencies & FX)
-import { adminGate, adminCan, adminStaffHandler } from '@/lib/adminStaff' // v3.97 — Batch 5 (Admin realm + staff RBAC)
+import { adminGate, adminCan, adminStaffHandler } from '@/lib/adminStaff'
+import { adminBranchesHandler, adminBranchUserAssignHandler } from '@/lib/adminBranches' // v5.0 — Enterprise branches (additive) // v3.97 — Batch 5 (Admin realm + staff RBAC)
 import { adminOrdersHandler, adminCommissionsLedgerHandler } from '@/lib/adminOrders' // v4.3 — unified orders + commissions ledger
 import { adminGeoHandler } from '@/lib/adminGeo' // v3.97 — Batch 5 (Geo locations)
 import { adminPayFinHandler } from '@/lib/adminPayFin' // v3.97 — Batch 5 (Payment methods & financial entities)
 import { adminRefDataHandler } from '@/lib/adminRefData' // v3.97 — Batch 5 (Unified reference data)
-import { adminBranchesHandler, adminBranchUserAssignHandler } from '@/lib/adminBranches' // v5.0 — Enterprise branches (additive)
 
 // v3.47 — Package image optimization settings (applied ONCE at upload; centralized — adjust here)
 const IMG_MAX_DIM = 1200        // longest side in px (aspect ratio preserved, never enlarged)
@@ -2689,8 +2689,9 @@ async function handleRoute(request, { params }) {
             const cfg = await getPricingConfig(db)
             const p = (cfg.plans || []).find(x => x.key === b.plan_key)
             if (p) {
-              upd.max_users = Number(p.max_users) === 0 ? null : Number(p.max_users) // v5.0 — null = unlimited
-              upd.max_branches = Number(p.max_branches) === 0 ? null : Number(p.max_branches) // v5.0 — null = unlimited
+              // v5.0 — unlimited stays UNLIMITED (null), never a fixed 9999 cap (enterprise)
+              upd.max_users = Number(p.max_users) === 0 ? null : Number(p.max_users)
+              upd.max_branches = Number(p.max_branches) === 0 ? null : Number(p.max_branches)
               if (Number(p.quota_limit) > 0) upd['journal_quota.limit'] = Number(p.quota_limit) // v4.0
             }
           }
@@ -7021,9 +7022,9 @@ async function handleRoute(request, { params }) {
 
     // Tickets
     // v3.21 — Installment alert for the logged-in tenant (proactive cash-flow reminder)
-    // v5.1 — نقطة 3: QUOTA-BASED alert (no months, no due dates): when the office has
-    // 100 or fewer journal entries remaining, prompt paying the NEXT unpaid installment.
     if (route === '/my/installment-alert' && method === 'GET') {
+      // v5.1 — نقطة 3: QUOTA-BASED alert (no months, no due dates): when the office has
+      // 100 or fewer journal entries remaining, prompt paying the NEXT unpaid installment.
       const t = await db.collection('tenants').findOne({ id: T })
       if (!t || t.billing_mode !== 'installments' || t.unlimited_journals) return ok({ alert: null })
       const list = Array.isArray(t.installments) ? t.installments : []
