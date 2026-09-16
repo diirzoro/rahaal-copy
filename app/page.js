@@ -32,7 +32,7 @@ import { Separator } from '@/components/ui/separator'
 import { Switch } from '@/components/ui/switch'
 // v3.87.5 — shared primitives + heavy screens extracted verbatim (structural move only)
 import { CUR_SYMBOL, CUR_NAME, CURRENCIES, fmt, readFileB64, DOC_OK_TYPES, DOC_MAX_MB, DOC_MAX_FILE_BYTES, DOC_BATCH_MAX_MB, DOC_BATCH_MAX_BYTES, validateDocBatch, todayISO, api, AuthCtx, useAuth, Field, TopBar, ConfirmHost, askConfirm } from './shared'
-
+// v4.9 — AdminApp shell removed: TenantApp is THE single authoritative dashboard (see App root)
 // v4.1 — MOVED AS-IS from the v3.91–3.97 admin shell into TenantApp «إدارة رحّال»
 // (transfer only — zero new sections, same components, same /api/admin/* endpoints):
 import AdminStaffCenter from './admin/staff' // إدارة المستخدمين (v3.97)
@@ -574,6 +574,7 @@ function SuperAdminPanel({ embedded = false }) {
   const [instRows, setInstRows] = useState([])
   const [instTarget, setInstTarget] = useState(null)
   const [quotaTarget, setQuotaTarget] = useState(null) // v4.0 — unified «زيادة حصة القيود» dialog
+  const [activating, setActivating] = useState(null) // v5.2 — the ONLY Trial→Paid path
   const [viewing, setViewing] = useState(null) // v4.9 — CRUD: View action → inline Office 360 (reused, no second details page)
   const [tq, setTq] = useState('') // v3.99 — Batch 1: search/filter (embedded mode)
   const load = async () => {
@@ -781,14 +782,7 @@ function SuperAdminPanel({ embedded = false }) {
                             } catch (e) { toast.error(e.message) }
                           }}>🎭 دخول كـ</Button>}
                           {!embedded && !t.activation_confirmed && (
-                            <Button size="sm" variant="outline" className="text-blue-600 border-blue-300" onClick={async () => {
-                              if (!(await askConfirm({ title: 'تأكيد دفع القسط الأول', desc: `تأكيد أن المكتب "${t.name}" قد دفع القسط الأول؟`, icon: '💳', confirmLabel: 'تأكيد الدفع' }))) return
-                              try {
-                                const r = await api(`/admin/tenants/${t.id}/confirm-payment`, { method: 'POST' })
-                                toast.success(r.referrer_bonus ? `✅ تم التأكيد + منح +${r.referrer_bonus.bonus_added} قيد إلى "${r.referrer_bonus.referrer_name}"` : '✅ تم تأكيد الدفع')
-                                load()
-                              } catch (e) { toast.error(e.message) }
-                            }}>💳 تأكيد دفع</Button>
+                            <Button size="sm" variant="outline" className="text-blue-600 border-blue-300" onClick={() => setActivating(t)}>💳 تفعيل الاشتراك</Button>
                           )}
                           {!embedded && <Button size="sm" variant="outline" className="text-emerald-600" onClick={() => setQuotaTarget(t)}><Plus className="w-3 h-3" /> زيادة حصة القيود</Button>}
                         </div>
@@ -814,6 +808,7 @@ function SuperAdminPanel({ embedded = false }) {
       <PricingConfigDialog open={pricingOpen} onOpenChange={setPricingOpen} />
       <InstallmentsDialog row={instTarget} onClose={() => setInstTarget(null)} onChanged={load} />
       <QuotaIncreaseDialog target={quotaTarget} onClose={() => setQuotaTarget(null)} onChanged={load} />
+      <ActivateSubscriptionDialog target={activating} onClose={() => setActivating(null)} onDone={load} />
     </div>
   )
 }
@@ -1157,78 +1152,209 @@ function PricingConfigDialog({ open, onOpenChange }) {
   )
 }
 
-// v3.16 — Installments management dialog (schedule + per-installment toggle + open-quota shortcut)
-function InstallmentsDialog({ row, onClose, onChanged }) {
-  const [list, setList] = useState([])
-  const [init, setInit] = useState({ total: 250, count: 5, start_date: new Date().toISOString().slice(0, 10) })
+// v3.16 → v5.1 — Installments dialog: QUOTA-BASED system (نقاط 3+4+7):
+// - The schedule is generated ONLY from the plan's final discounted price (server-side).
+// - No months / due dates: each installment opens 500 journal entries; all paid → ∞.
+// - Confirming a payment COLLECTS it: the office account is auto-selected, the staff
+//   picks the receiving box/bank, and the server creates the receipt voucher + journal.
+// v5.2 — نقطة 5: «تفعيل الاشتراك وإنشاء الحساب» — المسار الوحيد للتحويل Trial→Paid.
+// يعرض تسعير الباقة من مصدر الحقيقة الواحد (/pricing): السعر الأصلي، الخصم، السعر
+// النهائي — واسم الحساب المحاسبي قابلاً للتعديل (افتراضياً اسم المكتب) والحساب الأب
+// 1103 «العملاء» في دفتر رحّال للعرض فقط. لا تحديث تفاؤلي: النجاح يُعلَن حصراً من
+// استجابة الباك اند (حساب + قيد + أقساط)، والتكرار يُعاد duplicate بلا أثر مالي.
+function ActivateSubscriptionDialog({ target, onClose, onDone }) {
+  const [pricing, setPricing] = useState(null)
+  const [planKey, setPlanKey] = useState('')
+  const [billingMode, setBillingMode] = useState('annual')
+  const [accountName, setAccountName] = useState('')
   const [busy, setBusy] = useState(false)
-  useEffect(() => { if (row) setList(row.installments || []) }, [row])
-  if (!row) return null
-  const allPaid = list.length > 0 && list.every(i => i.paid)
-  const generate = async () => {
-    if (!Number(init.total)) return toast.error('أدخل المبلغ الإجمالي')
-    if (list.length > 0 && !(await askConfirm({ title: 'استبدال الجدول الحالي', desc: 'سيتم استبدال الجدول الحالي بالكامل.', icon: '🔄', variant: 'danger', confirmLabel: 'استبدال' }))) return
+  const [opId, setOpId] = useState(null) // idempotency — نقطة 9
+  useEffect(() => {
+    if (!target) return
+    setPlanKey(['silver', 'gold', 'enterprise'].includes(target.plan_tier) ? target.plan_tier : '')
+    setBillingMode(['annual', 'installments'].includes(target.billing_mode) ? target.billing_mode : 'annual')
+    setAccountName(target.name || '')
+    setOpId((typeof crypto !== 'undefined' && crypto.randomUUID) ? crypto.randomUUID() : `${Date.now()}-${Math.random()}`)
+    api('/pricing').then(setPricing).catch(e => toast.error(`تعذر جلب التسعير: ${e.message}`))
+  }, [target])
+  if (!target) return null
+  const plan = (pricing?.plans || []).find(p => p.key === planKey) || null
+  const pr = plan?.pricing || null
+  const disc = Number(pricing?.discount_percent) || 0
+  const cur = pr?.currency === 'USD' ? '$' : (pr?.currency ? `${pr.currency} ` : '')
+  const submit = async () => {
+    if (!planKey || !pr) return toast.error('اختر باقة مدفوعة أولاً')
+    if (!String(accountName).trim()) return toast.error('اسم الحساب المحاسبي مطلوب')
     try {
       setBusy(true)
-      const r = await api(`/admin/tenants/${row.id}/installments`, { method: 'PUT', body: init })
-      setList(r.installments); toast.success('✅ تم إنشاء جدول الأقساط'); onChanged()
+      const r = await api(`/admin/tenants/${target.id}/subscription-activate`, {
+        method: 'POST',
+        body: { plan_key: planKey, billing_mode: billingMode, account_name: accountName.trim(), op_id: opId },
+      })
+      if (r.duplicate) {
+        toast.info('ℹ️ هذا التفعيل نُفذ مسبقاً بنفس العملية — لا أثر مالي مكرر')
+      } else {
+        toast.success(`✅ فُعّل الاشتراك — حساب المكتب ${r.account?.created ? `أُنشئ بكود ${r.account?.code}` : `موجود مسبقاً (${r.account?.code}) وأُعيد استخدامه`} · قيد المبيعات ${r.journal?.duplicate ? 'مسجل مسبقاً' : `مُثبت بقيمة ${cur}${r.pricing?.final_total}`}`, { duration: 9000 })
+        if (r.installments?.length) toast.success(`💳 جدول أقساط: ${r.installments.length} قسط — كل قسط يفتح 500 قيد`, { duration: 7000 })
+        if (r.referrer_bonus) toast.success(`🎁 مُنح +${r.referrer_bonus.bonus_added} قيد للمُحيل «${r.referrer_bonus.referrer_name}»`, { duration: 7000 })
+      }
+      onDone(); onClose()
     } catch (e) { toast.error(e.message) } finally { setBusy(false) }
   }
-  const togglePaid = async (ins) => {
+  return (
+    <Dialog open={!!target} onOpenChange={v => { if (!v) onClose() }}>
+      <DialogContent className="max-w-lg max-h-[90vh] overflow-y-auto" dir="rtl">
+        <DialogHeader>
+          <DialogTitle>💳 تفعيل الاشتراك وإنشاء الحساب: {target.name}</DialogTitle>
+          <DialogDescription>عملية واحدة معتمدة: حساب المكتب في دفتر رحّال + قيد مبيعات الاشتراك بكامل القيمة بعد الخصم + تطبيق حدود الباقة{billingMode === 'installments' ? ' + جدول الأقساط بالقيود' : ''}</DialogDescription>
+        </DialogHeader>
+        <div className="grid grid-cols-2 gap-3">
+          <Field label="الباقة *">
+            <Select value={planKey || 'none'} onValueChange={v => setPlanKey(v === 'none' ? '' : v)}>
+              <SelectTrigger><SelectValue placeholder="اختر الباقة" /></SelectTrigger>
+              <SelectContent>
+                <SelectItem value="none">— اختر —</SelectItem>
+                {(pricing?.plans || []).map(p => <SelectItem key={p.key} value={p.key}>{p.icon} {p.name_ar}</SelectItem>)}
+              </SelectContent>
+            </Select>
+          </Field>
+          <Field label="طريقة الدفع *">
+            <Select value={billingMode} onValueChange={setBillingMode}>
+              <SelectTrigger><SelectValue /></SelectTrigger>
+              <SelectContent>
+                <SelectItem value="annual">📅 سنوي دفعة واحدة</SelectItem>
+                <SelectItem value="installments">💳 أقساط (كل قسط يفتح 500 قيد)</SelectItem>
+              </SelectContent>
+            </Select>
+          </Field>
+        </div>
+        {pr ? (
+          <div className="p-3 rounded-lg border border-blue-200 bg-blue-50/60 space-y-2">
+            <div className="grid grid-cols-3 gap-2 text-center">
+              <div><div className="text-[10px] text-slate-500">السعر الأصلي</div><div className={`font-black ${disc > 0 ? 'line-through text-slate-400' : 'text-slate-800'}`}>{cur}{pr.annual.original}</div></div>
+              <div><div className="text-[10px] text-slate-500">الخصم</div><div className={`font-black ${disc > 0 ? 'text-rose-600' : 'text-slate-400'}`}>{disc > 0 ? `-${disc}%` : '—'}</div></div>
+              <div><div className="text-[10px] text-slate-500">السعر النهائي (يُقيَّد)</div><div className="font-black text-emerald-700">{cur}{pr.annual.final}</div></div>
+            </div>
+            {billingMode === 'installments' && (
+              <div className="text-[11px] text-blue-800 text-center border-t border-blue-200 pt-2">💳 {pr.installment.count} قسط × {cur}{pr.installment.final_per} — كل قسط يفتح 500 قيد يومية، وبعد الأخير تصبح القيود غير محدودة ♾️</div>
+            )}
+            <div className="text-[10px] text-slate-500 text-center">قيد البيع: مدين «حساب المكتب» / دائن «مبيعات اشتراكات رحّال» بكامل {cur}{pr.annual.final} مرة واحدة</div>
+          </div>
+        ) : planKey ? <div className="text-center text-xs text-slate-400 py-2">جارِ جلب التسعير…</div> : null}
+        <Field label="اسم الحساب المحاسبي (قابل للتعديل) *">
+          <Input value={accountName} onChange={e => setAccountName(e.target.value)} placeholder="افتراضياً: اسم المكتب" />
+        </Field>
+        <div className="p-2 rounded-md border bg-slate-50 text-[11px] text-slate-600">
+          الحساب الأب: <b>1103 — العملاء / ذمم مدينة (دفتر رحّال)</b> — للعرض فقط · الربط الدائم: <span className="font-mono" dir="ltr">office_id</span> — إعادة التفعيل لا تنشئ حساباً مكرراً أبداً
+        </div>
+        <DialogFooter>
+          <Button variant="outline" onClick={onClose}>إلغاء</Button>
+          <Button onClick={submit} disabled={busy || !planKey || !pr} className="bg-emerald-600 hover:bg-emerald-700 text-white">{busy ? '⏳ جارِ التفعيل…' : '💳 تفعيل الاشتراك وإنشاء الحساب'}</Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  )
+}
+
+function InstallmentsDialog({ row, onClose, onChanged }) {
+  const [list, setList] = useState([])
+  const [busy, setBusy] = useState(false)
+  const [boxes, setBoxes] = useState([])
+  const [paying, setPaying] = useState(null) // installment awaiting box selection
+  const [boxId, setBoxId] = useState('')
+  useEffect(() => { if (row) setList(row.installments || []) }, [row])
+  useEffect(() => {
+    // Rahaal book boxes/banks (the SA session IS the Rahaal company book)
+    if (row) api('/boxes').then(d => setBoxes(Array.isArray(d) ? d : [])).catch(() => setBoxes([]))
+  }, [row])
+  if (!row) return null
+  const allPaid = list.length > 0 && list.every(i => i.paid)
+  const paidCount = list.filter(i => i.paid).length
+  const generate = async () => {
+    if (list.length > 0 && !(await askConfirm({ title: 'إعادة توليد الجدول', desc: 'يُولَّد الجدول من السعر النهائي للباقة بعد الخصم (مصدر واحد للحقيقة). يُرفض إن وُجدت أقساط محصّلة.', icon: '🔄', variant: 'danger', confirmLabel: 'توليد' }))) return
     try {
-      const r = await api(`/admin/tenants/${row.id}/installments`, { method: 'PATCH', body: { no: ins.no, paid: !ins.paid } })
-      setList(l => l.map(x => x.no === ins.no ? { ...x, paid: !ins.paid, paid_at: !ins.paid ? new Date().toISOString() : null } : x))
+      setBusy(true)
+      const r = await api(`/admin/tenants/${row.id}/installments`, { method: 'PUT', body: {} })
+      setList(r.installments)
+      toast.success(`✅ جدول جديد: ${r.installments.length} قسط × $${r.per} = $${r.total} (${r.currency}) — كل قسط يفتح ${r.entries_per_installment} قيد`)
       onChanged()
-      if (r.all_paid) toast.success('🎉 كل الأقساط مسددة! يمكنك الآن فتح القيود للمكتب', { duration: 6000 })
-    } catch (e) { toast.error(e.message) }
+    } catch (e) { toast.error(e.message) } finally { setBusy(false) }
   }
-  const openQuota = async () => {
+  const confirmPay = async () => {
+    if (!boxId) return toast.error('اختر الصندوق/البنك المستلم')
     try {
-      await api(`/admin/tenants/${row.id}`, { method: 'PATCH', body: { unlimited_journals: true } })
-      toast.success('♾️ تم فتح القيود المحاسبية للمكتب'); onChanged(); onClose()
+      setBusy(true)
+      const r = await api(`/admin/tenants/${row.id}/installments`, { method: 'PATCH', body: { no: paying.no, paid: true, box_id: boxId } })
+      setList(l => l.map(x => x.no === paying.no ? { ...x, paid: true, paid_at: new Date().toISOString(), voucher_id: r.voucher_id } : x))
+      setPaying(null); setBoxId(''); onChanged()
+      if (r.unlimited) toast.success('🎉 القسط الأخير معتمد — تحولت القيود إلى غير محدودة ♾️', { duration: 7000 })
+      else toast.success(`✅ حُصِّل القسط ${paying.no} بسند قبض — حصة القيود الجديدة: ${r.new_quota_limit}`, { duration: 6000 })
+    } catch (e) { toast.error(e.message) } finally { setBusy(false) }
+  }
+  const unpay = async (ins) => {
+    if (!(await askConfirm({ title: `تراجع عن القسط ${ins.no}`, desc: 'يُرفض التراجع إن كان القسط محصّلاً بسند قبض (يتطلب عكساً محاسبياً بقرار).', icon: '↩️', variant: 'danger', confirmLabel: 'تراجع' }))) return
+    try {
+      await api(`/admin/tenants/${row.id}/installments`, { method: 'PATCH', body: { no: ins.no, paid: false } })
+      setList(l => l.map(x => x.no === ins.no ? { ...x, paid: false, paid_at: null } : x))
+      onChanged()
     } catch (e) { toast.error(e.message) }
   }
   return (
     <Dialog open={!!row} onOpenChange={v => { if (!v) onClose() }}>
       <DialogContent className="max-w-lg max-h-[90vh] overflow-y-auto" dir="rtl">
         <DialogHeader><DialogTitle>💳 أقساط: {row.name}</DialogTitle>
-          <DialogDescription>جدولة ومتابعة سداد الأقساط — {row.plan_tier ? `الباقة: ${row.plan_tier}` : 'بدون باقة'}</DialogDescription></DialogHeader>
-        {/* Schedule generator */}
+          <DialogDescription>نظام الأقساط بالقيود — كل قسط يفتح 500 قيد، وبعد القسط الأخير تصبح القيود غير محدودة ♾️</DialogDescription></DialogHeader>
         <div className="p-3 rounded-lg border bg-slate-50 space-y-2">
-          <div className="text-xs font-bold text-slate-600">{list.length > 0 ? '🔄 إعادة جدولة (تستبدل الحالي)' : '➕ إنشاء جدول أقساط'}</div>
-          <div className="grid grid-cols-3 gap-2">
-            <Field label="الإجمالي $"><Input type="number" min="0" value={init.total} onChange={e => setInit({ ...init, total: Number(e.target.value) })} className="font-bold" /></Field>
-            <Field label="عدد الأقساط"><Input type="number" min="1" max="24" value={init.count} onChange={e => setInit({ ...init, count: Number(e.target.value) })} /></Field>
-            <Field label="أول استحقاق"><Input type="date" value={init.start_date} onChange={e => setInit({ ...init, start_date: e.target.value })} /></Field>
-          </div>
-          <Button size="sm" onClick={generate} disabled={busy} variant="outline" className="w-full border-blue-300 text-blue-700">📅 توليد الجدول (شهري)</Button>
+          <div className="text-xs font-bold text-slate-600">{list.length > 0 ? '🔄 إعادة توليد الجدول' : '➕ توليد جدول الأقساط'}</div>
+          <div className="text-[11px] text-slate-500">يُحسب الإجمالي تلقائياً من <b>السعر النهائي للباقة بعد الخصم</b> (مصدر واحد لكل الشاشات) — لا إدخال يدوي للمبلغ ولا تواريخ استحقاق.</div>
+          <Button size="sm" onClick={generate} disabled={busy} variant="outline" className="w-full border-blue-300 text-blue-700">🧮 توليد من سعر الباقة النهائي</Button>
         </div>
-        {/* Installments list */}
         {list.length === 0 ? (
           <div className="text-center text-slate-400 text-sm py-3">لا يوجد جدول أقساط بعد</div>
         ) : (
           <div className="space-y-1.5">
-            {list.map(ins => {
-              const overdue = !ins.paid && ins.due_date < new Date().toISOString().slice(0, 10)
-              return (
-                <div key={ins.no} className={`flex items-center justify-between p-2 rounded-lg border ${ins.paid ? 'bg-emerald-50 border-emerald-200' : overdue ? 'bg-rose-50 border-rose-300' : 'bg-white'}`}>
+            <div className="flex items-center justify-between text-[11px] font-bold">
+              <span className="text-slate-500">محصّل: {paidCount} / {list.length}</span>
+              <span className="text-blue-700">الإجمالي (SSOT بعد الخصم): ${+(list.reduce((s, i) => s + (Number(i.amount) || 0), 0)).toFixed(2)} — {list.length} قسط × ${list[0]?.amount ?? 0}</span>
+            </div>
+            {list.map(ins => (
+              <div key={ins.no} className={`p-2 rounded-lg border ${ins.paid ? 'bg-emerald-50 border-emerald-200' : 'bg-white'}`}>
+                <div className="flex items-center justify-between">
                   <div className="flex items-center gap-2">
                     <span className={`w-6 h-6 rounded-full flex items-center justify-center text-[11px] font-black ${ins.paid ? 'bg-emerald-500 text-white' : 'bg-slate-200'}`}>{ins.no}</span>
                     <div>
                       <div className="text-sm font-bold">${ins.amount}</div>
-                      <div className="text-[10px] text-slate-500">استحقاق: {ins.due_date}{overdue && <span className="text-rose-600 font-bold"> — متأخر!</span>}{ins.paid && ins.paid_at && <span className="text-emerald-600"> — سُدد {String(ins.paid_at).slice(0, 10)}</span>}</div>
+                      <div className="text-[10px] text-slate-500">
+                        يفتح {ins.entries_grant || 500} قيد
+                        {ins.paid && ins.paid_at && <span className="text-emerald-600"> — حُصِّل {String(ins.paid_at).slice(0, 10)}</span>}
+                        {ins.voucher_id && <span className="text-blue-600"> · 🧾 سند قبض</span>}
+                      </div>
                     </div>
                   </div>
-                  <Button size="sm" onClick={() => togglePaid(ins)} variant={ins.paid ? 'outline' : 'default'} className={ins.paid ? 'h-7 text-xs text-rose-600' : 'h-7 text-xs bg-emerald-600 hover:bg-emerald-700 text-white'}>
-                    {ins.paid ? '↩️ تراجع' : '✅ تسجيل السداد'}
-                  </Button>
+                  {ins.paid
+                    ? <Button size="sm" onClick={() => unpay(ins)} variant="outline" className="h-7 text-xs text-rose-600">↩️ تراجع</Button>
+                    : <Button size="sm" onClick={() => { setPaying(ins); setBoxId('') }} className="h-7 text-xs bg-emerald-600 hover:bg-emerald-700 text-white">💰 تأكيد دفع القسط</Button>}
                 </div>
-              )
-            })}
+                {paying?.no === ins.no && !ins.paid && (
+                  <div className="mt-2 p-2 rounded-md bg-amber-50 border border-amber-200 space-y-2">
+                    <div className="text-[11px] font-bold text-amber-800">تحصيل ${ins.amount} — حساب المكتب محدد تلقائياً · اختر حساب الاستلام:</div>
+                    <select value={boxId} onChange={e => setBoxId(e.target.value)} className="h-8 w-full rounded-md border px-2 text-xs bg-white">
+                      <option value="">— اختر الصندوق / البنك —</option>
+                      {boxes.map(bx => <option key={bx.id} value={bx.id}>{bx.type === 'cash' ? '💵' : '🏦'} {bx.name_ar}</option>)}
+                    </select>
+                    <div className="text-[10px] text-slate-500">البيان: «تحصيل القسط رقم {ins.no} — اشتراك رحّال» · يُنشأ سند القبض والقيد تلقائياً — لا حاجة لسند يدوي</div>
+                    <div className="flex gap-2">
+                      <Button size="sm" disabled={busy || !boxId} onClick={confirmPay} className="h-7 text-xs bg-emerald-600 hover:bg-emerald-700 text-white">تأكيد التحصيل</Button>
+                      <Button size="sm" variant="outline" className="h-7 text-xs" onClick={() => setPaying(null)}>إلغاء</Button>
+                    </div>
+                  </div>
+                )}
+              </div>
+            ))}
           </div>
         )}
-        {allPaid && !row.unlimited_journals && (
-          <Button onClick={openQuota} className="w-full bg-emerald-600 hover:bg-emerald-700 text-white font-bold">🎉 كل الأقساط مسددة — ♾️ فتح القيود المحاسبية الآن</Button>
+        {allPaid && (
+          <div className="p-3 rounded-lg bg-emerald-50 border border-emerald-200 text-center text-sm font-bold text-emerald-700">🎉 كل الأقساط محصّلة — القيود غير محدودة ♾️ تلقائياً</div>
         )}
         <DialogFooter><Button variant="outline" onClick={onClose}>إغلاق</Button></DialogFooter>
       </DialogContent>
@@ -1283,7 +1409,7 @@ function QuotaIncreaseDialog({ target, onClose, onChanged }) {
 }
 
 // v4.0 — Batch 2: «الاشتراكات والأقساط» screen inside TenantApp — reuses the OLD APIs
-// and dialogs verbatim (confirm-payment v2.8, installments v3.16, unlimited toggle v3.14,
+// and dialogs (subscription-activate v5.2, installments v5.1 quota-based, unlimited toggle v3.14,
 // EditTenantDialog overrides). Demo→Paid conversion lives here.
 function PlatformSubscriptionsScreen() {
   const [data, setData] = useState(null)
@@ -1291,6 +1417,7 @@ function PlatformSubscriptionsScreen() {
   const [instTarget, setInstTarget] = useState(null)
   const [editing, setEditing] = useState(null)
   const [quotaTarget, setQuotaTarget] = useState(null)
+  const [activating, setActivating] = useState(null) // v5.2 — the ONLY Trial→Paid path
   const [q, setQ] = useState('')
   const load = async () => {
     try {
@@ -1308,14 +1435,8 @@ function PlatformSubscriptionsScreen() {
   const trialCount = tenants.filter(t => (t.subscription || 'trial') === 'trial').length
   const paidCount = tenants.filter(t => t.subscription === 'paid' || t.activation_confirmed).length
   const overdueCount = instRows.filter(r => r.overdue).length
-  const confirmPayment = async (t) => {
-    if (!(await askConfirm({ title: 'تحويل إلى مدفوع (Demo → Paid)', desc: `تأكيد أن المكتب "${t.name}" قد دفع؟ سيُفعَّل الاشتراك المدفوع فوراً.`, icon: '💳', confirmLabel: 'تأكيد الدفع' }))) return
-    try {
-      const r = await api(`/admin/tenants/${t.id}/confirm-payment`, { method: 'POST' })
-      toast.success(r.referrer_bonus ? `✅ تم التأكيد + منح +${r.referrer_bonus.bonus_added} قيد إلى "${r.referrer_bonus.referrer_name}"` : '✅ تم تأكيد الدفع — المكتب مدفوع الآن')
-      load()
-    } catch (e) { toast.error(e.message) }
-  }
+  // v5.2 — Trial→Paid conversion goes EXCLUSIVELY through ActivateSubscriptionDialog
+  // (subscription-activate): office ledger account + sale journal + limits + installments.
   const toggleUnlimited = async (t) => {
     const next = !t.unlimited_journals
     if (!(await askConfirm({ title: next ? '♾️ فتح القيود المحاسبية' : '🔒 إغلاق القيود المحاسبية', desc: next ? `فتح قيود غير محدودة للمكتب "${t.name}"؟ (مثلاً بعد سداد آخر قسط أو دفع سنوي)` : `إعادة المكتب "${t.name}" إلى الحصة المحدودة؟`, icon: next ? '♾️' : '🔒', confirmLabel: 'تأكيد' }))) return
@@ -1386,7 +1507,7 @@ function PlatformSubscriptionsScreen() {
                     </TableCell>
                     <TableCell className="text-left">
                       <div className="flex gap-1 justify-end flex-wrap">
-                        {!t.activation_confirmed && <Button size="sm" variant="outline" className="h-7 text-[11px] text-blue-600 border-blue-300" onClick={() => confirmPayment(t)}>💳 تأكيد الدفع</Button>}
+                        {!t.activation_confirmed && <Button size="sm" variant="outline" className="h-7 text-[11px] text-blue-600 border-blue-300" onClick={() => setActivating(t)}>💳 تفعيل الاشتراك</Button>}
                         <Button size="sm" variant="outline" className="h-7 text-[11px]" onClick={() => setInstTarget({ id: t.id, name: t.name, plan_tier: t.plan_tier, installments: (insById[t.id]?.installments) || t.installments || [], unlimited_journals: !!t.unlimited_journals })}>📅 الأقساط</Button>
                         <Button size="sm" variant="outline" className={`h-7 text-[11px] ${t.unlimited_journals ? 'text-rose-600' : 'text-emerald-600'}`} onClick={() => toggleUnlimited(t)}>{t.unlimited_journals ? '🔒 إغلاق القيود' : '♾️ فتح القيود'}</Button>
                         <Button size="sm" variant="outline" className="h-7 text-[11px] text-emerald-700" onClick={() => setQuotaTarget(t)}>➕ زيادة حصة القيود</Button>
@@ -1404,12 +1525,13 @@ function PlatformSubscriptionsScreen() {
       <InstallmentsDialog row={instTarget} onClose={() => setInstTarget(null)} onChanged={load} />
       <EditTenantDialog tenant={editing} onOpenChange={v => { if (!v) setEditing(null) }} onSaved={() => { setEditing(null); load() }} />
       <QuotaIncreaseDialog target={quotaTarget} onClose={() => setQuotaTarget(null)} onChanged={load} />
+      <ActivateSubscriptionDialog target={activating} onClose={() => setActivating(null)} onDone={load} />
     </div>
   )
 }
 
 // v4.2 — «مبيعات برنامج رحّال»: PROGRAM sales (plans/subscriptions/renewals) built on
-// EXISTING data only (tenants + pricing_config + installments + confirm-payment) —
+// EXISTING data only (tenants + pricing_config + installments + subscription-activate) —
 // NO parallel sales engine, NO travel data (tickets/visas/services are excluded by design).
 // A true draft-sale object with its own timeline needs a NEW collection → pending approval.
 function ProgramSalesScreen() {
@@ -1418,6 +1540,7 @@ function ProgramSalesScreen() {
   const [instRows, setInstRows] = useState([])
   const [editing, setEditing] = useState(null)
   const [instTarget, setInstTarget] = useState(null)
+  const [activating, setActivating] = useState(null) // v5.2 — the ONLY Trial→Paid path
   const [q, setQ] = useState('')
   const [fPlan, setFPlan] = useState('all')
   const [fStatus, setFStatus] = useState('all')
@@ -1452,10 +1575,7 @@ function ProgramSalesScreen() {
     .filter(r => (fPlan === 'all' || r.t.plan_tier === fPlan))
     .filter(r => (fStatus === 'all' || r.status === fStatus))
     .filter(r => !q.trim() || `${r.t.name} ${r.t.slug || ''}`.includes(q.trim()))
-  const confirmPayment = async (t) => {
-    if (!(await askConfirm({ title: 'اعتماد البيع وتأكيد الدفع', desc: `اعتماد بيع الباقة للمكتب "${t.name}"؟ يتحول لمدفوع فوراً (لا يمكن تنفيذه مرتين).`, icon: '💳', confirmLabel: 'اعتماد وتأكيد' }))) return
-    try { await api(`/admin/tenants/${t.id}/confirm-payment`, { method: 'POST' }); toast.success('✅ اعتُمد البيع — المكتب مدفوع'); load() } catch (e) { toast.error(e.message) }
-  }
+  // v5.2 — sale approval goes EXCLUSIVELY through ActivateSubscriptionDialog (accounting-backed)
   const exportCSV = () => {
     const head = ['المكتب', 'الباقة', 'الحالة', 'السعر الأساسي', 'الخصم%', 'السعر النهائي (مرجعي)', 'سعر الاشتراك المسجل', 'العملة', 'طريقة الدفع', 'المدفوع', 'المتبقي', 'بداية التفعيل', 'انتهاء الاشتراك']
     const lines = rows.map(r => [r.t.name, r.t.plan_tier || '', r.status, r.base ?? '', disc, r.final ?? '', r.t.subscription_price || '', r.currency, r.t.billing_mode || '', r.paidAmt, r.remaining, r.t.activation_confirmed_at ? String(r.t.activation_confirmed_at).slice(0, 10) : '', r.t.subscription_expires_at ? String(r.t.subscription_expires_at).slice(0, 10) : ''])
@@ -1504,7 +1624,7 @@ function ProgramSalesScreen() {
                   <TableCell className="text-[10px]">{t.activation_confirmed_at ? String(t.activation_confirmed_at).slice(0, 10) : '—'} ← {t.subscription_expires_at ? String(t.subscription_expires_at).slice(0, 10) : '—'}</TableCell>
                   <TableCell className="text-left"><div className="flex gap-1 justify-end flex-wrap">
                     <Button size="sm" variant="outline" className="h-7 text-[11px]" title="مسودة البيع: الباقة/السعر/العملة/طريقة الدفع/التواريخ" onClick={() => setEditing(t)}>📝 مسودة/تعديل</Button>
-                    {!t.activation_confirmed && ['silver', 'gold', 'enterprise'].includes(t.plan_tier) && <Button size="sm" variant="outline" className="h-7 text-[11px] text-blue-600 border-blue-300" onClick={() => confirmPayment(t)}>💳 اعتماد البيع</Button>}
+                    {!t.activation_confirmed && <Button size="sm" variant="outline" className="h-7 text-[11px] text-blue-600 border-blue-300" onClick={() => setActivating(t)}>💳 اعتماد البيع (تفعيل)</Button>}
                     <Button size="sm" variant="outline" className="h-7 text-[11px]" onClick={() => setInstTarget({ id: t.id, name: t.name, plan_tier: t.plan_tier, installments: (insById[t.id]?.installments) || t.installments || [], unlimited_journals: !!t.unlimited_journals })}>📅 الأقساط</Button>
                   </div></TableCell>
                 </TableRow>
@@ -1514,9 +1634,10 @@ function ProgramSalesScreen() {
           </TableBody>
         </Table>
       </CardContent></Card>
-      <div className="text-[11px] text-amber-700 bg-amber-50 border border-amber-200 rounded p-2">⚠️ حدود موثقة: الإلغاء/الاسترداد المالي غير متاح — لا ربط بعد بين الاعتماد وسندات القبض (فجوة موثقة)، وسجل «مسودة بيع» مستقل بجدول حالات كامل يحتاج Collection جديدة بانتظار موافقتك.</div>
+      <div className="text-[11px] text-emerald-700 bg-emerald-50 border border-emerald-200 rounded p-2">✅ v5.2: اعتماد البيع مربوط بالمحاسبة بالكامل — التفعيل يُنشئ حساب المكتب في دفتر رحّال ويثبت قيد المبيعات، وتحصيل الأقساط يصدر سند قبض وقيداً تلقائياً. «المدفوع/المتبقي» أعلاه للعرض — المرجع المحاسبي هو كشف حساب المكتب (Office 360 ← كشف الحساب).</div>
       <EditTenantDialog tenant={editing} onOpenChange={v => { if (!v) setEditing(null) }} onSaved={() => { setEditing(null); load() }} />
       <InstallmentsDialog row={instTarget} onClose={() => setInstTarget(null)} onChanged={load} />
+      <ActivateSubscriptionDialog target={activating} onClose={() => setActivating(null)} onDone={load} />
     </div>
   )
 }
@@ -2027,7 +2148,8 @@ function EditTenantDialog({ tenant, onOpenChange, onSaved }) {
             {f.plan_key && <div className="text-[10px] text-blue-600 mt-1">سيُطبّق: {PLAN_LIMITS[f.plan_key]}</div>}
           </Field>
           <Field label="طريقة الدفع">
-            <Select value={f.billing_mode || 'none'} onValueChange={v => setF({ ...f, billing_mode: v === 'none' ? '' : v, ...(v === 'annual' ? { unlimited_journals: true } : {}) })}>
+            {/* v5.2 — no auto-open on 'annual': journals open ONLY via subscription-activate (post-payment) or the explicit manual toggle below */}
+            <Select value={f.billing_mode || 'none'} onValueChange={v => setF({ ...f, billing_mode: v === 'none' ? '' : v })}>
               <SelectTrigger><SelectValue placeholder="—" /></SelectTrigger>
               <SelectContent>
                 <SelectItem value="none">— بدون —</SelectItem>
@@ -2460,7 +2582,10 @@ const canModule = (user, tabId) => {
   if (!user) return false
   // v3.99 — Batch 1: «إدارة رحّال» group is for the PLATFORM SUPER ADMIN only
   // (checked BEFORE the owner shortcut so office owners never see it)
-  if (String(tabId).startsWith('platform-')) return user.role === 'super_admin'
+  // v4.9 — admin_staff (Rahaal managers) now also see the platform entries INSIDE TenantApp
+  // (the separate AdminApp shell was removed); every action stays server-gated per section
+  // via adminGate/adminCan — this is UI visibility only.
+  if (String(tabId).startsWith('platform-')) return user.role === 'super_admin' || user.role === 'admin_staff'
   if (user.role === 'owner') return true
   // v3.98 — Phase 1: the platform SA manages his own company office settings
   // (currencies & rates live here). Staff still never see settings.
@@ -11297,6 +11422,128 @@ function BackupSection({ tenant }) {
 }
 
 
+// v5.2 — نقطة 2: إدارة الفروع من داخل حساب المكتب (المالك فقط — الباك اند يفرضها أيضاً).
+// نفس محرك الفروع الموحّد (/tenant/branches → adminBranchesHandler): الحد الفعلي يأتي
+// حصراً من الباك اند (allowed / unlimited / max_branches) — الواجهة لا تفترض أن
+// Enterprise دائماً غير محدود ولا تحسب الحدود محلياً.
+function TenantBranchesCard() {
+  const [data, setData] = useState(null)
+  const [form, setForm] = useState(null) // null = مغلق · {} = جديد · {id,...} = تعديل
+  const [busy, setBusy] = useState(false)
+  const load = () => api('/tenant/branches').then(setData).catch(e => toast.error(e.message))
+  useEffect(() => { load() }, [])
+  if (!data) return <Card><CardContent className="py-10 text-center text-slate-400">جارِ التحميل…</CardContent></Card>
+  const branches = data.branches || []
+  const limitLabel = data.unlimited ? '♾️ غير محدود' : `${branches.length} / ${data.max_branches ?? '—'}`
+  const canAdd = data.allowed && (data.unlimited || branches.length < Number(data.max_branches || 0))
+  if (!data.allowed) return (
+    <Card><CardContent className="py-10 text-center space-y-2">
+      <div className="text-3xl">🏢</div>
+      <div className="font-bold text-slate-700">مكتبك لا يملك حد فروع مفعّلاً</div>
+      <div className="text-xs text-slate-500">حد الفروع يُمنح من إدارة رحّال حسب الباقة (باقتك: <b>{data.plan_tier || '—'}</b>) — تواصل مع الإدارة لترقية الباقة أو منح حد فروع خاص</div>
+    </CardContent></Card>
+  )
+  const save = async () => {
+    if (!String(form?.name || '').trim()) return toast.error('اسم الفرع مطلوب')
+    setBusy(true)
+    try {
+      const body = { name: form.name, code: form.code, phone: form.phone, address: form.address, notes: form.notes }
+      if (form.id) await api(`/tenant/branches/${form.id}`, { method: 'PUT', body })
+      else await api('/tenant/branches', { method: 'POST', body })
+      toast.success(form.id ? '✅ حُدّث الفرع' : '✅ أُنشئ الفرع')
+      setForm(null); load()
+    } catch (e) { toast.error(e.message) }
+    setBusy(false)
+  }
+  const setStatus = async (br, action) => {
+    if (!(await askConfirm({
+      title: action === 'suspend' ? `إيقاف الفرع «${br.name}»` : `تفعيل الفرع «${br.name}»`,
+      desc: action === 'suspend' ? 'سيُعلَّم الفرع موقوفاً فقط — لا حذف ولا مساس بأي بيانات أو مستخدمين.' : 'سيعود الفرع نشطاً ويمكن ربط مستخدمين به.',
+      icon: '🏢', confirmLabel: 'تأكيد',
+    }))) return
+    try { await api(`/tenant/branches/${br.id}`, { method: 'PATCH', body: { action } }); toast.success('تم'); load() } catch (e) { toast.error(e.message) }
+  }
+  const assign = async (u, branchId) => {
+    try { await api(`/tenant/users/${u.id}/branch`, { method: 'PATCH', body: { branch_id: branchId || null } }); toast.success('🔗 حُدّث ربط المستخدم'); load() } catch (e) { toast.error(e.message) }
+  }
+  return (
+    <div className="space-y-4">
+      <Card>
+        <CardHeader className="flex flex-row items-center justify-between">
+          <div>
+            <CardTitle className="text-base">🏢 فروع المكتب <Badge variant="outline" className="mr-2">{limitLabel}</Badge></CardTitle>
+            <div className="text-[11px] text-slate-500 mt-1">حد الفروع يُطبَّق من الخادم حسب باقتك — كل فرع مرتبط بمكتبك بشكل دائم</div>
+          </div>
+          <Button size="sm" onClick={() => setForm({})} disabled={!canAdd} className="grad-brand text-white gap-1" title={canAdd ? '' : `بلغت حد الفروع (${data.max_branches})`}><Plus className="w-4 h-4" /> إضافة فرع</Button>
+        </CardHeader>
+        <CardContent>
+          {!canAdd && !data.unlimited && <div className="mb-3 text-[11px] text-amber-700 bg-amber-50 border border-amber-200 rounded p-2">⚠️ بلغت حد الفروع المسموح لباقتك ({data.max_branches}) — لزيادة الحد تواصل مع إدارة رحّال</div>}
+          {form !== null && (
+            <div className="mb-4 p-3 rounded-lg border bg-slate-50 grid grid-cols-1 md:grid-cols-5 gap-2 items-end">
+              <Field label="اسم الفرع *"><Input value={form.name || ''} onChange={e => setForm({ ...form, name: e.target.value })} /></Field>
+              <Field label="كود (اختياري)"><Input value={form.code || ''} onChange={e => setForm({ ...form, code: e.target.value })} /></Field>
+              <Field label="هاتف"><Input dir="ltr" value={form.phone || ''} onChange={e => setForm({ ...form, phone: e.target.value })} /></Field>
+              <Field label="العنوان"><Input value={form.address || ''} onChange={e => setForm({ ...form, address: e.target.value })} /></Field>
+              <div className="flex gap-2">
+                <Button size="sm" onClick={save} disabled={busy} className="bg-emerald-600 hover:bg-emerald-700 text-white">{busy ? '...' : form.id ? 'حفظ' : 'إنشاء'}</Button>
+                <Button size="sm" variant="outline" onClick={() => setForm(null)}>إلغاء</Button>
+              </div>
+            </div>
+          )}
+          {branches.length === 0 ? (
+            <div className="text-center text-slate-400 text-sm py-6">لا توجد فروع بعد — أضف فرعك الأول</div>
+          ) : (
+            <Table>
+              <TableHeader><TableRow><TableHead>الفرع</TableHead><TableHead>الهاتف</TableHead><TableHead>العنوان</TableHead><TableHead className="text-center">المستخدمون</TableHead><TableHead className="text-center">الحالة</TableHead><TableHead className="text-left">إجراء</TableHead></TableRow></TableHeader>
+              <TableBody>
+                {branches.map(br => (
+                  <TableRow key={br.id}>
+                    <TableCell><b>{br.name}</b>{br.code && <span className="text-[10px] text-slate-400 font-mono mr-1">({br.code})</span>}</TableCell>
+                    <TableCell dir="ltr" className="text-xs">{br.phone || '—'}</TableCell>
+                    <TableCell className="text-xs">{br.address || '—'}</TableCell>
+                    <TableCell className="text-center text-xs font-bold">{br.users_count ?? 0}</TableCell>
+                    <TableCell className="text-center">{br.status === 'active' ? <Badge className="bg-emerald-100 text-emerald-700 hover:bg-emerald-100">نشط</Badge> : <Badge className="bg-rose-100 text-rose-700 hover:bg-rose-100">موقوف</Badge>}</TableCell>
+                    <TableCell className="text-left"><div className="flex gap-1 justify-end">
+                      <Button size="sm" variant="outline" className="h-7 text-xs" onClick={() => setForm({ id: br.id, name: br.name, code: br.code || '', phone: br.phone || '', address: br.address || '', notes: br.notes || '' })}>✏️ تعديل</Button>
+                      {br.status === 'active'
+                        ? <Button size="sm" variant="outline" className="h-7 text-xs text-rose-600" onClick={() => setStatus(br, 'suspend')}>⏸️ إيقاف</Button>
+                        : <Button size="sm" variant="outline" className="h-7 text-xs text-emerald-600" onClick={() => setStatus(br, 'activate')}>▶️ تفعيل</Button>}
+                    </div></TableCell>
+                  </TableRow>
+                ))}
+              </TableBody>
+            </Table>
+          )}
+        </CardContent>
+      </Card>
+      {branches.length > 0 && (
+        <Card>
+          <CardHeader><CardTitle className="text-sm">🔗 ربط المستخدمين بالفروع <span className="text-[10px] font-normal text-slate-400">— بدون فرع = المركز الرئيسي</span></CardTitle></CardHeader>
+          <CardContent>
+            <Table>
+              <TableHeader><TableRow><TableHead>المستخدم</TableHead><TableHead>البريد</TableHead><TableHead>الفرع</TableHead></TableRow></TableHeader>
+              <TableBody>
+                {(data.users || []).map(u => (
+                  <TableRow key={u.id}>
+                    <TableCell className="text-sm"><b>{u.name}</b> {u.role === 'owner' && <Badge variant="outline" className="text-[9px] mr-1">مالك</Badge>}</TableCell>
+                    <TableCell dir="ltr" className="text-xs">{u.email}</TableCell>
+                    <TableCell>
+                      <select value={u.branch_id || ''} onChange={e => assign(u, e.target.value)} className="h-8 rounded-md border px-2 text-xs bg-white">
+                        <option value="">🏠 المركز الرئيسي</option>
+                        {branches.filter(b => b.status === 'active').map(b => <option key={b.id} value={b.id}>🏢 {b.name}</option>)}
+                      </select>
+                    </TableCell>
+                  </TableRow>
+                ))}
+              </TableBody>
+            </Table>
+          </CardContent>
+        </Card>
+      )}
+    </div>
+  )
+}
+
 function OfficeSettings() {
   const { settings, refreshMe, user, tenant } = useAuth()
   const [f, setF] = useState({
@@ -11363,6 +11610,7 @@ function OfficeSettings() {
         <TabsList className="bg-slate-100">
           <TabsTrigger value="brand"><ImageIcon className="w-4 h-4 ml-1" /> الهوية والعلامة</TabsTrigger>
           <TabsTrigger value="users"><Users className="w-4 h-4 ml-1" /> المستخدمون</TabsTrigger>
+          {user?.role === 'owner' && <TabsTrigger value="branches">🏢 الفروع</TabsTrigger>}
           <TabsTrigger value="rates"><ArrowUpRight className="w-4 h-4 ml-1" /> أسعار الصرف</TabsTrigger>
           <TabsTrigger value="referrals">🎁 نظام الإحالة</TabsTrigger>
           <TabsTrigger value="extension" className="hidden lg:inline-flex">🕋 إضافة المتصفح</TabsTrigger>
@@ -11457,6 +11705,13 @@ function OfficeSettings() {
           </Card>
           <PermissionsDialog target={permTarget} onClose={() => setPermTarget(null)} onSaved={() => { setPermTarget(null); api('/tenant/users').then(setUsers).catch(() => {}); toast.success('تم حفظ الصلاحيات') }} />
         </TabsContent>
+
+        {/* v5.2 — نقطة 2: الفروع من داخل حساب المكتب نفسه (المالك فقط) — نفس محرك الفروع */}
+        {user?.role === 'owner' && (
+          <TabsContent value="branches" className="mt-4">
+            <TenantBranchesCard />
+          </TabsContent>
+        )}
 
         <TabsContent value="rates" className="mt-4">
           <Card>
@@ -13049,13 +13304,43 @@ function App() {
     <AuthCtx.Provider value={{ ...auth, refreshMe, logout }}>
       <TestEnvBadge />
       <ConfirmHost />
-      {/* v5 — TenantApp is the ONLY authenticated interface for every role. The old AdminApp
-          (app/admin/shell.js) is no longer mounted anywhere: the platform super_admin lands in
-          the shared Rahaal company book, a classic super_admin (no tenant) lands on the platform
-          home, and admin_staff land in the same shared TenantApp. The «إدارة المنصة» button is
-          a pure in-app navigation shortcut to the «إدارة رحّال» group inside TenantApp. */}
-      <TenantApp />
+      {/* v4.9+v5 (merged) — TenantApp IS the single authoritative dashboard for every role:
+          the company book (vouchers, boxes/banks, COA, journals) + the moved platform admin
+          sections, all RBAC-gated inside ONE app. The separate AdminApp shell was REMOVED and
+          «إدارة المنصة» is a pure in-app navigation shortcut (see Sidebar). STRICTER Emergent
+          rule kept: a platform account (super_admin / admin_staff) MUST already be bound to
+          the Rahaal company tenant; an unbound account gets an explicit blocking notice —
+          NO alternate panel, NO auto tenant creation, NO auto binding on login. */}
+      {(() => {
+        const isPlatformRole = auth.user.role === 'super_admin' || auth.user.role === 'admin_staff'
+        if (isPlatformRole && !auth.user.tenant_id) {
+          return <AdminBindingRequiredNotice user={auth.user} logout={logout} />
+        }
+        return <TenantApp />
+      })()}
     </AuthCtx.Provider>
+  )
+}
+
+// v4.9 — explicit blocking notice for a platform account that is NOT bound to the Rahaal
+// company tenant. Deliberately does NOT open any panel and does NOT touch any data:
+// the binding itself (setting tenant_id on the user document) requires explicit approval.
+function AdminBindingRequiredNotice({ user, logout }) {
+  return (
+    <div dir="rtl" className="min-h-screen flex items-center justify-center bg-gradient-to-br from-slate-900 via-blue-950 to-slate-900 p-4">
+      <div className="max-w-xl w-full bg-white rounded-2xl shadow-2xl p-8 text-center space-y-4">
+        <div className="w-16 h-16 mx-auto rounded-2xl bg-amber-100 flex items-center justify-center text-4xl">⚠️</div>
+        <h1 className="text-xl font-extrabold text-slate-800">حساب الإدارة غير مربوط بدفتر شركة رحّال</h1>
+        <p className="text-sm text-slate-600 leading-relaxed">
+          حسابك (<b>{user?.email}</b>) بدور «{user?.role === 'super_admin' ? 'المشرف العام' : 'موظف إدارة'}»
+          لكنه غير مربوط بأي Tenant، ولوحة التحكم المعتمدة هي تطبيق الشركة الموحّد (TenantApp).
+          لأسباب تتعلق بسلامة البيانات لا يُنشأ الربط تلقائياً عند الدخول —
+          يلزم ربط الحساب يدوياً بدفتر شركة رحّال عبر عملية معتمدة من الإدارة.
+        </p>
+        <div className="text-xs text-slate-400">راجع فريق التطوير لاعتماد الربط، ثم أعد تسجيل الدخول.</div>
+        <button onClick={logout} className="px-6 py-2.5 rounded-lg bg-slate-800 text-white text-sm font-bold hover:bg-slate-700 transition">تسجيل الخروج</button>
+      </div>
+    </div>
   )
 }
 

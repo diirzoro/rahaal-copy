@@ -322,3 +322,24 @@ See /app/memory/test_credentials.md
 ## v4.8.2 — PR#18 النقطة الأخيرة (route.js فقط، +18/−1، NOT TESTED)
 - POST /journal-entries: عند result.unsafe_state لم يعد bad() يُسقط الحالة — استجابة HTTP 500 عبر cors(NextResponse.json) تتضمن unsafe_state وno_retry:true وتحذيراً صريحاً (لا إعادة محاولة؛ فحص يدوي للقيد والأرصدة) + تسجيل je_audit(create_failed_unsafe_state) بالـ tenant والمنفذ ونوع الحالة وتفاصيل الخطأ. الأخطاء العادية قبل الكتابة بقيت bad(400) كما هي. لا تعويض إضافي، لا إعادة محاولة تلقائية، مسار PUT لم يُمس.
 - الحفظ إلى فرع PR#18 يتم حصراً عبر زر «Save to GitHub» من المستخدم (الوكيل لا ينفذ أي عملية git كتابية). لا Merge/Deploy.
+
+## v4.9 — TenantApp هو الداشبورد المعتمد الوحيد + إزالة AdminApp المنفصل (NOT TESTED)
+- السبب الجذري لظهور AdminApp على Test: fallback في App root كان يوجه super_admin بلا tenant_id (وadmin_staff دائماً) إلى AdminApp المنفصل + زر «إدارة المنصة» وswitcher platformView.
+- أُزيل: import shell، زر إدارة المنصة، platformView state، prop onOpenPlatform (Sidebar+TenantApp)، وكتلة fallback بالكامل. حُذف app/admin/shell.js (مستورد من page.js فقط — تم فحص الاعتمادات).
+- أُبقي: كل مكونات app/admin المستخدمة في تبويبات TenantApp (staff/perms/sales/commissions/notifications/requests/offices/system/audit/backup/health/currency/geo/payfin) + SuperAdminPanel (embedded في platform-offices) + AnnouncementsManager (platform-ads) + جميع /api/admin/* والصلاحيات. ملفات يتيمة أُبقيت عمداً كوظائف قابلة للربط لاحقاً (لا تدخل الحزمة): dashboard/accounting/ads/reports/disputes/refdata.
+- الجديد: حساب منصة (super_admin/admin_staff) بلا tenant_id يرى شاشة إيقاف صريحة AdminBindingRequiredNotice — لا لوحة بديلة، لا إنشاء/ربط تلقائي؛ الربط اليدوي (tenant_id على وثيقة المستخدم) يتطلب موافقة. canModule: platform-* صارت تشمل admin_staff (UI فقط، الخادم يفرض adminGate/adminCan).
+- Git: لا وصول للريموت من البيئة (git ls-remote فشل) — التحقق من دمج PR#18 وأحدث main تعذر من هنا؛ الحفظ لفرع جديد يتم حصراً عبر زر Save to GitHub من المستخدم. لا Merge/Deploy.
+
+## v5.0 — فروع باقة Enterprise (إضافي وIdempotent — Test فقط، Gold/Silver بلا مساس)
+- Collection جديدة `branches` (id, tenant_id, name, code, phone, address, notes, status active|suspended, created/updated at/by) + فهرسان idempotent: فريد {tenant_id,name} و{tenant_id,status} (فشل الفهرس لا يُبتلع — POST يُرفض 503).
+- حقل اختياري جديد users.branch_id (null = المركز الرئيسي) — لا تعديل تلقائي لأي مستخدم قائم.
+- APIs جديدة خلف adminGate (قسم offices): GET/POST /admin/tenants/:id/branches، PUT/PATCH(activate|suspend) /admin/tenants/:id/branches/:bid، PATCH /admin/tenants/:id/users/:uid/branch — الإنشاء enterprise-only، الربط tenant-scoped (يستحيل ربط عابر للمكاتب)، الفرع الموقوف لا يقبل ربطاً جديداً.
+- دلالة غير محدود: null/undefined/0 القديمة = غير محدود (لا صفر ولا حد ثابت)؛ تعيين الباقات لم يعد يحول 0→9999 بل null (سطرا التعيين + بوابة /tenant/users). Gold/Silver (2/1 و8/3) كما هي حرفياً. لا تعديل على وثائق plans/tenants القائمة.
+- UI: تبويب «الفروع» في Office 360 (offices.js) بزر «➕ إضافة فرع» + تعديل + تفعيل/إيقاف + ربط المستخدمين بالفروع؛ لغير الإنتربرايز تظهر رسالة توضيحية فقط. عرض ∞ للحدود غير المحدودة.
+- لا منطق محاسبي/توحيد فروع في هذه المهمة (بأمر صريح — يُختبر لاحقاً). Compile ✓ (1459 modules). لا Deploy/Live.
+
+## v5.2 — Subscription Accounting Integration (9-point plan COMPLETE)
+- Backend: subscription-activate = THE ONLY Trial→Paid gate (office client account under 1103 in Rahaal book by office_id, sale journal Dr office/Cr 4106 «مبيعات اشتراكات رحّال» at final discounted price, referral bonus moved here once-only, activation_confirmed stamped). Legacy confirm-payment RETIRED (410). PATCH guard blocks manual subscription='paid'. isPaidTenant (features) split from isUnlimitedTenant (journal quota — installments offices are quota-based until last installment). GET /admin/tenants/:id/office-statement reuses reportStatement.
+- Frontend: ActivateSubscriptionDialog (SSOT pricing display, editable account name, parent 1103 read-only, op_id idempotency) replaced ALL 3 confirm-payment buttons. InstallmentsDialog quota-based + box/bank required. Office 360: statement tab + owner WhatsApp/Call buttons. TenantApp Settings: owner branches tab (/tenant/branches, backend-driven limits).
+- Old installment offices left untouched (no bulk quota raise, no auto-unlimited). No migrations/backfills.
+- NEXT: user QA; then separate extended Enterprise branch-accounting QA (user-led; no design assumptions).

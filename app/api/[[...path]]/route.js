@@ -21,7 +21,8 @@ import { adminNotifyHandler } from '@/lib/adminNotify' // v3.95 — Batch 3 (In-
 import { adminReportsHandler } from '@/lib/adminReports' // v3.96 — Batch 4 (Reports — READ-ONLY)
 import { adminDisputesHandler } from '@/lib/adminDisputes' // v3.96 — Batch 4 (Disputes)
 import { adminCurrencyHandler } from '@/lib/adminCurrency' // v3.96 — Batch 4 (Currencies & FX)
-import { adminGate, adminCan, adminStaffHandler } from '@/lib/adminStaff' // v3.97 — Batch 5 (Admin realm + staff RBAC)
+import { adminGate, adminCan, adminStaffHandler } from '@/lib/adminStaff'
+import { adminBranchesHandler, adminBranchUserAssignHandler } from '@/lib/adminBranches' // v5.0 — Enterprise branches (additive) // v3.97 — Batch 5 (Admin realm + staff RBAC)
 import { adminOrdersHandler, adminCommissionsLedgerHandler } from '@/lib/adminOrders' // v4.3 — unified orders + commissions ledger
 import { adminGeoHandler } from '@/lib/adminGeo' // v3.97 — Batch 5 (Geo locations)
 import { adminPayFinHandler } from '@/lib/adminPayFin' // v3.97 — Batch 5 (Payment methods & financial entities)
@@ -116,6 +117,124 @@ const dateRangeExpr = (field, fromDate, toDate) => {
   if (fromDate) conds.push({ $gte: [{ $toDate: `$${field}` }, fromDate] })
   if (toDate) conds.push({ $lte: [{ $toDate: `$${field}` }, toDate] })
   return conds.length ? { $expr: conds.length === 1 ? conds[0] : { $and: conds } } : null
+}
+
+// ============================================================================
+// v5.1 — RAHAAL SUBSCRIPTION BILLING CORE (نقاط 3+4+5+6+7+9)
+// - computePlanPricing: the SINGLE SOURCE OF TRUTH for the final (post-discount)
+//   plan price — identical math to /pricing (kept in ONE place, used by both).
+// - Installments are QUOTA-based (each installment opens 500 journal entries),
+//   never month/due-date based. All paid → unlimited journals.
+// - The office ledger account lives in the RAHAAL company book (is_platform_org
+//   tenant) as a standard CLIENT leaf under COA.CLIENTS — reusing the existing
+//   engine (statements, vouchers, balances) with ZERO parallel accounting logic.
+// - Idempotency everywhere: office account unique by office_id, sale journal by
+//   idempotency_key, installment collection by voucher_id + paid transition.
+// ============================================================================
+const INSTALLMENT_ENTRIES_GRANT = 500
+const INSTALLMENT_ALERT_REMAINING = 100
+const REV_SUBSCRIPTIONS_CODE = '4106' // الإيرادات → مبيعات اشتراكات رحّال
+
+async function computePlanPricing(db, planKey) {
+  const cfg = await getPricingConfig(db)
+  const p = (cfg.plans || []).find(x => x.key === planKey)
+  if (!p || p.active === false) return { error: 'الباقة غير موجودة أو غير مفعلة' }
+  const nowP = new Date()
+  const inWindow = (!cfg.offer_start_at || new Date(cfg.offer_start_at) <= nowP) && (!cfg.offer_end_at || nowP <= new Date(cfg.offer_end_at))
+  const disc = (cfg.discount_enabled && inWindow) ? Math.min(95, Math.max(0, Number(cfg.discount_percent) || 0)) : 0
+  const annualOriginal = Number(p.annual_price) || 0
+  const annualFinal = Math.round(annualOriginal * (100 - disc)) / 100 // same math as /pricing
+  const count = Math.min(24, Math.max(1, Number(cfg.installments_count) || 5))
+  const per = Math.round((annualFinal / count) * 100) / 100
+  return { plan: p, currency: p.currency || 'USD', discount_percent: disc, original_total: annualOriginal, final_total: annualFinal, installments_count: count, per_installment: per }
+}
+
+// Deterministic (idempotent — recompute, never +=) quota from installments state:
+// limit = 500 × (paid + 1) [the active block + the next one being paid],
+// never below what is already used; ALL paid → unlimited journals.
+async function applyInstallmentQuota(db, tenantId) {
+  const t = await db.collection('tenants').findOne({ id: tenantId })
+  const list = Array.isArray(t?.installments) ? t.installments : []
+  if (!list.length) return null
+  const paid = list.filter(i => i.paid).length
+  if (paid === list.length) {
+    await db.collection('tenants').updateOne({ id: tenantId }, { $set: { unlimited_journals: true } })
+    return { unlimited: true, paid, total: list.length }
+  }
+  const used = Number(t.journal_quota?.used) || 0
+  const limit = Math.max(INSTALLMENT_ENTRIES_GRANT * (paid + 1), used)
+  await db.collection('tenants').updateOne({ id: tenantId }, { $set: { unlimited_journals: false, 'journal_quota.limit': limit } })
+  return { unlimited: false, limit, paid, total: list.length }
+}
+
+async function getRahaalBookTenantId(db) {
+  const org = await db.collection('tenants').findOne({ is_platform_org: true }, { projection: { id: 1 } })
+  return org?.id || null
+}
+
+// Idempotent by fixed code — creates «مبيعات اشتراكات رحّال» leaf under الإيرادات (41)
+// in the RAHAAL book only. Additive; never touches other tenants' charts.
+async function ensureSubscriptionRevenueAccount(db, rahaalT) {
+  const ex = await db.collection('accounts').findOne({ tenant_id: rahaalT, code: REV_SUBSCRIPTIONS_CODE })
+  if (ex) return ex
+  const parent = await db.collection('accounts').findOne({ tenant_id: rahaalT, code: COA.REV_GROUP })
+  if (!parent) throw new Error(`مجموعة الإيرادات (${COA.REV_GROUP}) غير موجودة في دفتر رحّال`)
+  const doc = {
+    id: uuidv4(), tenant_id: rahaalT, code: REV_SUBSCRIPTIONS_CODE, name_ar: 'مبيعات اشتراكات رحّال',
+    type: 'revenue', parent: COA.REV_GROUP, is_group: false, is_system: true,
+    notes: 'v5.1 — إيراد اشتراكات برنامج رحّال (أُنشئ تلقائياً عند أول اعتماد)', created_at: new Date(),
+  }
+  await db.collection('accounts').insertOne(doc)
+  return doc
+}
+
+// Office ledger account = a standard CLIENT in the Rahaal book, linked by office_id.
+// Idempotent: an existing client with the same office_id is ALWAYS reused — a second
+// account for the same office can never be created (نقطة 5+9).
+async function ensureOfficeClientAccount(db, rahaalT, office, accountName) {
+  const existing = await db.collection('clients').findOne({ tenant_id: rahaalT, office_id: office.id })
+  if (existing) return { client: existing, created: false }
+  const name = String(accountName || office.name || '').trim() || office.name
+  const accountInfo = await generateSubAccountCode(db, rahaalT, COA.CLIENTS) // Parent = عملاء (دفتر رحّال)
+  const doc = {
+    id: uuidv4(), tenant_id: rahaalT, office_id: office.id, name,
+    phone: office.owner_phone || '', whatsapp: '', address: '', email: '',
+    notes: `حساب مكتب مشترك في رحّال — office_id: ${office.id}`,
+    parent_code: COA.CLIENTS, ...accountInfo,
+    credit_limit: 0, credit_currency: 'USD', is_frozen: false,
+    balances: emptyBalances(), created_at: new Date(),
+  }
+  await db.collection('clients').insertOne(doc)
+  return { client: doc, created: true }
+}
+
+// نقطة 6: Dr حساب المكتب (عميل) / Cr مبيعات اشتراكات رحّال — بكامل قيمة الاشتراك بعد الخصم.
+// Fail-fast dry-run through the central gate BEFORE any balance effect + tracked
+// compensation + idempotency_key (نقطة 9) — v4.8 hardening pattern.
+async function postSubscriptionSaleJournal(db, rahaalT, { client, office, amount, currency, opId, actor }) {
+  const revenue = await ensureSubscriptionRevenueAccount(db, rahaalT)
+  const cliLeaf = partyLeafCode(client)
+  const idKey = `sub_sale:${office.id}:${opId}`
+  const dup = await db.collection('journal_entries').findOne({ tenant_id: rahaalT, idempotency_key: idKey })
+  if (dup) return { je: dup, duplicate: true }
+  const lines = [
+    { account_code: cliLeaf, account_name: 'العملاء', party_type: 'client', party_id: client.id, party_name: client.name, debit: amount, credit: 0 },
+    { account_code: REV_SUBSCRIPTIONS_CODE, account_name: revenue.name_ar, party_type: 'revenue', party_id: null, party_name: `اشتراك ${office.name}`, debit: 0, credit: amount },
+  ]
+  const date = new Date()
+  await enforceJournalInvariants(db, rahaalT, { date, currency, lines }) // dry-run — zero side effects on rejection
+  await updateBalance(db, 'clients', { id: client.id, tenant_id: rahaalT }, currency, amount)
+  try {
+    const je = await createJournalEntry(db, rahaalT, {
+      date, description: `مبيعات اشتراك رحّال — ${office.name} (${amount} ${currency})`,
+      ref_type: 'subscription_sale', ref_id: office.id, currency, lines,
+    }, { skipQuota: true, idempotencyKey: idKey, actor, source: 'subscription_sale' })
+    return { je, duplicate: false }
+  } catch (e) {
+    try { await updateBalance(db, 'clients', { id: client.id, tenant_id: rahaalT }, currency, -amount) }
+    catch (rb) { throw new Error(`⛔ فشل قيد الاشتراك (${e?.message}) وتعذر التراجع عن رصيد حساب المكتب (${rb?.message}) — يلزم فحص يدوي فوري`) }
+    throw e
+  }
 }
 
 // ================= Seeding =================
@@ -497,8 +616,18 @@ function sanitizeTenant(t) { return t ? { id: t.id, name: t.name, slug: t.slug, 
 // IMMEDIATELY on selection, before any payment. REMOVED: benefits now open ONLY after
 // «تأكيد الدفع» (confirm-payment → subscription='paid' / activation_confirmed) or an
 // explicit manual unlimited_journals override by the Super Admin.
-function isUnlimitedTenant(t) {
+// v5.2 — SPLIT (نقطة 3): «عميل مدفوع» (بوابات الميزات) ≠ «قيود غير محدودة» (بوابة الحصة).
+// مكتب الأقساط عميلٌ مدفوع بكامل الميزات، لكن قيوده تُفتح كتلة-كتلة (500 قيد لكل قسط
+// محصَّل) ولا تصبح غير محدودة إلا بعد تحصيل القسط الأخير (unlimited_journals=true
+// عبر applyInstallmentQuota) أو بتدخل يدوي صريح من السوبر أدمن.
+function isPaidTenant(t) {
   return !!t && (t.unlimited_journals === true || t.subscription === 'paid' || !!t.activation_confirmed)
+}
+function isUnlimitedTenant(t) {
+  if (!t) return false
+  if (t.unlimited_journals === true) return true
+  if (t.billing_mode === 'installments') return false // quota-based — never unlimited by paid status
+  return t.subscription === 'paid' || !!t.activation_confirmed
 }
 
 const DEFAULT_PRICING_CONFIG = {
@@ -1744,8 +1873,9 @@ async function handleRoute(request, { params }) {
         const cfgT = await getPricingConfig(db)
         const dp = cfgT.default_trial_plan_key ? (cfgT.plans || []).find(p => p.key === cfgT.default_trial_plan_key && p.active !== false) : null
         if (dp) trialLimits = {
-          max_users: Number(dp.max_users) === 0 ? 9999 : (Number(dp.max_users) || 2),
-          max_branches: Number(dp.max_branches) === 0 ? 9999 : (Number(dp.max_branches) || 1),
+          // v5.0 — unlimited stays UNLIMITED (null), never converted to a fixed 9999 cap
+          max_users: Number(dp.max_users) === 0 ? null : (Number(dp.max_users) || 2),
+          max_branches: Number(dp.max_branches) === 0 ? null : (Number(dp.max_branches) || 1),
           quota: Number(dp.quota_limit) > 0 ? Number(dp.quota_limit) : 30,
           plan_tier: dp.key,
         }
@@ -2037,6 +2167,25 @@ async function handleRoute(request, { params }) {
         return ok(r360)
       }
 
+      // v5.0 — ENTERPRISE BRANCHES (additive; behind adminGate → section «offices»).
+      // GET list / POST create (enterprise-only) / PUT edit / PATCH activate|suspend.
+      // Logic lives in lib/adminBranches.js — no accounting/consolidation here.
+      const brMatch = route.match(/^\/admin\/tenants\/([^/]+)\/branches(?:\/([^/]+))?$/)
+      if (brMatch) {
+        const bodyBr = ['POST', 'PUT', 'PATCH'].includes(method) ? await request.json().catch(() => ({})) : null
+        const rBr = await adminBranchesHandler(db, brMatch[1], brMatch[2] || null, method, bodyBr, sess)
+        if (rBr?.error) return bad(rBr.error, rBr.status || 400)
+        return ok(rBr)
+      }
+      // v5.0 — link a user to ONE branch of the SAME tenant (null = head office)
+      const brUserMatch = route.match(/^\/admin\/tenants\/([^/]+)\/users\/([^/]+)\/branch$/)
+      if (brUserMatch && method === 'PATCH') {
+        const bodyBu = await request.json().catch(() => ({}))
+        const rBu = await adminBranchUserAssignHandler(db, brUserMatch[1], brUserMatch[2], bodyBu)
+        if (rBu?.error) return bad(rBu.error, rBu.status || 400)
+        return ok(rBu)
+      }
+
       // v3.16 — Installments tracker (SaaS billing follow-up)
       if (route === '/admin/installments-overview' && method === 'GET') {
         const tenants = await db.collection('tenants').find({ billing_mode: 'installments' }).toArray()
@@ -2052,6 +2201,10 @@ async function handleRoute(request, { params }) {
             installments: list, paid_count: paid, total_count: list.length,
             next_due: next?.due_date || null, next_amount: next?.amount || null,
             overdue, all_paid: list.length > 0 && paid === list.length,
+            // v5.1 — quota-based system fields
+            subscription_price: t.subscription_price || null,
+            quota: { limit: Number(t.journal_quota?.limit) || 0, used: Number(t.journal_quota?.used) || 0 },
+            entries_per_installment: INSTALLMENT_ENTRIES_GRANT,
           }
         })
         rows.sort((a, b) => (b.overdue ? 1 : 0) - (a.overdue ? 1 : 0))
@@ -2059,22 +2212,30 @@ async function handleRoute(request, { params }) {
       }
       {
         const mIns = route.match(/^\/admin\/tenants\/([^/]+)\/installments$/)
-        // PUT — create/replace the schedule (total, count, start_date → monthly due dates)
+        // v5.1 — نقاط 3+4: PUT regenerates the schedule from the plan's FINAL discounted
+        // price ONLY (single source of truth — no client-provided totals, NO due dates).
+        // Each installment opens 500 journal entries; all paid → unlimited.
         if (mIns && method === 'PUT') {
-          const b = await request.json()
-          const total = Math.max(0, Number(b.total) || 0)
-          const count = Math.min(24, Math.max(1, Number(b.count) || 5))
-          if (!total) return bad('المبلغ الإجمالي مطلوب')
-          const start = b.start_date ? new Date(b.start_date) : new Date()
-          const per = Math.round((total / count) * 100) / 100
-          const list = Array.from({ length: count }, (_, i) => {
-            const d = new Date(start); d.setMonth(d.getMonth() + i)
-            return { no: i + 1, amount: per, due_date: d.toISOString().slice(0, 10), paid: false, paid_at: null }
-          })
-          await db.collection('tenants').updateOne({ id: mIns[1] }, { $set: { installments: list, billing_mode: 'installments', updated_at: new Date() } })
-          return ok({ success: true, installments: list })
+          const t = await db.collection('tenants').findOne({ id: mIns[1] })
+          if (!t) return bad('المكتب غير موجود', 404)
+          const planKey = ['silver', 'gold', 'enterprise'].includes(t.plan_tier) ? t.plan_tier : null
+          if (!planKey) return bad('عيّن باقة مدفوعة للمكتب أولاً — الأقساط تُولَّد حصراً من السعر النهائي للباقة بعد الخصم')
+          const cur = Array.isArray(t.installments) ? t.installments : []
+          if (cur.some(i => i.paid)) return bad('يوجد أقساط محصّلة بالفعل — إعادة توليد الجدول تمس تحصيلات مالية وتتطلب قراراً صريحاً', 409)
+          const pricing = await computePlanPricing(db, planKey)
+          if (pricing.error) return bad(pricing.error)
+          const list = Array.from({ length: pricing.installments_count }, (_, i) => ({
+            no: i + 1, amount: pricing.per_installment, paid: false, paid_at: null,
+            entries_grant: INSTALLMENT_ENTRIES_GRANT, voucher_id: null,
+          }))
+          await db.collection('tenants').updateOne({ id: mIns[1] }, { $set: { installments: list, billing_mode: 'installments', subscription_price: pricing.final_total, updated_at: new Date() } })
+          await applyInstallmentQuota(db, mIns[1])
+          return ok({ success: true, installments: list, total: pricing.final_total, per: pricing.per_installment, currency: pricing.currency, entries_per_installment: INSTALLMENT_ENTRIES_GRANT })
         }
-        // PATCH — mark a single installment paid/unpaid
+        // v5.1 — نقاط 7+9: confirming an installment payment COLLECTS it in the Rahaal book:
+        // Dr الصندوق/البنك المختار / Cr حساب المكتب — via the EXISTING receipt-voucher engine
+        // (voucher + journal + balances in one confirmed step, no manual second receipt).
+        // Idempotent: an already-collected installment never posts twice.
         if (mIns && method === 'PATCH') {
           const b = await request.json()
           const t = await db.collection('tenants').findOne({ id: mIns[1] })
@@ -2082,11 +2243,143 @@ async function handleRoute(request, { params }) {
           const list = Array.isArray(t.installments) ? t.installments : []
           const idx = list.findIndex(i => i.no === Number(b.no))
           if (idx === -1) return bad('القسط غير موجود')
-          list[idx] = { ...list[idx], paid: !!b.paid, paid_at: b.paid ? new Date() : null }
+          const ins = list[idx]
+          if (b.paid === false) {
+            // reversal of a COLLECTED installment = financial reversal → explicit decision only
+            if (ins.voucher_id) return bad('هذا القسط محصّل بسند قبض مرتبط — عكسه يتطلب سنداً/قيداً عكسياً بقرار صريح ولا يُلغى بضغطة زر', 409)
+            list[idx] = { ...ins, paid: false, paid_at: null }
+            await db.collection('tenants').updateOne({ id: mIns[1] }, { $set: { installments: list, updated_at: new Date() } })
+            await applyInstallmentQuota(db, mIns[1])
+            return ok({ success: true, paid_count: list.filter(i => i.paid).length })
+          }
+          if (ins.paid) return ok({ success: true, duplicate: true, note: 'القسط محصّل مسبقاً — لا أثر مالي مكرر', voucher_id: ins.voucher_id || null })
+          const boxId = String(b.box_id || '')
+          if (!boxId) return bad('حدد حساب الاستلام (صندوق أو بنك) لتحصيل القسط — حساب المكتب محدد تلقائياً')
+          const rahaalT = await getRahaalBookTenantId(db)
+          if (!rahaalT) return bad('دفتر شركة رحّال غير مهيأ (is_platform_org) — لا يمكن تحصيل قسط بلا دفتر محاسبي', 500)
+          const cli = await db.collection('clients').findOne({ tenant_id: rahaalT, office_id: t.id })
+          if (!cli) return bad('لا يوجد حساب محاسبي لهذا المكتب في دفتر رحّال — اعتمد تحويل الاشتراك أولاً (يُنشئ الحساب)', 409)
+          const vres = await createVoucher(db, rahaalT, {
+            type: 'receipt', party_type: 'client', party_id: cli.id, box_id: boxId,
+            amount: Number(ins.amount) || 0,
+            currency: t.subscription_activation?.currency || 'USD',
+            date: new Date().toISOString(),
+            description: `تحصيل القسط رقم ${ins.no} — اشتراك رحّال (${t.name})`,
+          }, { skipQuota: true })
+          if (vres.error) return bad(`تعذر إنشاء سند التحصيل: ${vres.error}`)
+          list[idx] = { ...ins, paid: true, paid_at: new Date(), voucher_id: vres.doc?.id || null, box_id: boxId, collected_by: sess.user.email }
           await db.collection('tenants').updateOne({ id: mIns[1] }, { $set: { installments: list, updated_at: new Date() } })
-          const allPaid = list.length > 0 && list.every(i => i.paid)
-          return ok({ success: true, all_paid: allPaid, paid_count: list.filter(i => i.paid).length })
+          const q = await applyInstallmentQuota(db, mIns[1])
+          return ok({ success: true, all_paid: list.every(i => i.paid), unlimited: !!q?.unlimited, new_quota_limit: q?.limit || null, paid_count: list.filter(i => i.paid).length, voucher_id: list[idx].voucher_id })
         }
+      }
+
+      // v5.2 — نقطة 8: كشف حساب المكتب الحقيقي من دفتر الأستاذ في دفتر رحّال — نفس محرك
+      // كشوفات الحساب الموجود (reportStatement) بلا أي منطق موازٍ: الرصيد = القيود الفعلية
+      // (قيد مبيعات الاشتراك مديناً − سندات تحصيل الأقساط دائناً). شاشة المبيعات تُطابقه.
+      const mOfficeStmt = route.match(/^\/admin\/tenants\/([^/]+)\/office-statement$/)
+      if (mOfficeStmt && method === 'GET') {
+        const t = await db.collection('tenants').findOne({ id: mOfficeStmt[1] })
+        if (!t) return bad('المكتب غير موجود', 404)
+        const rahaalT = await getRahaalBookTenantId(db)
+        if (!rahaalT) return bad('دفتر شركة رحّال غير مهيأ (is_platform_org)', 500)
+        const cli = await db.collection('clients').findOne({ tenant_id: rahaalT, office_id: t.id })
+        if (!cli) return bad('لا يوجد حساب محاسبي لهذا المكتب في دفتر رحّال بعد — فعّل الاشتراك أولاً (التفعيل يُنشئ الحساب)', 404)
+        const urlStmt = new URL(request.url)
+        const qStmt = Object.fromEntries(urlStmt.searchParams.entries())
+        const stmt = await reportStatement(db, rahaalT, { ...qStmt, party_type: 'client', party_id: cli.id })
+        return ok({ office_client: { id: cli.id, name: cli.name, account_code: cli.account_code || null }, statement: stmt })
+      }
+
+      // v5.1 — نقاط 4+5+6+9: اعتماد تحويل المكتب من Trial إلى باقة مدفوعة بعملية واحدة مؤكدة:
+      // (1) حساب المكتب في دفتر رحّال (عميل تحت «العملاء» — Idempotent بـ office_id، الاسم قابل
+      // للتعديل من نافذة التأكيد) (2) قيد مبيعات الاشتراك بكامل القيمة بعد الخصم (3) حدود الباقة
+      // (4) جدول أقساط مبني على القيود عند اختيار التقسيط. لا يعمل أثناء Trial — فقط عند التحويل.
+      const activateMatch = route.match(/^\/admin\/tenants\/([^/]+)\/subscription-activate$/)
+      if (activateMatch && method === 'POST') {
+        const b = await request.json()
+        const office = await db.collection('tenants').findOne({ id: activateMatch[1] })
+        if (!office) return bad('المكتب غير موجود', 404)
+        if (office.is_platform_org) return bad('لا يُفعَّل اشتراك على دفتر رحّال نفسه')
+        const planKey = String(b.plan_key || '')
+        if (!['silver', 'gold', 'enterprise'].includes(planKey)) return bad('اختر باقة مدفوعة صالحة')
+        const billingMode = ['annual', 'installments'].includes(b.billing_mode) ? b.billing_mode : 'annual'
+        const opId = String(b.op_id || '').slice(0, 64)
+        if (!opId) return bad('op_id مطلوب (منع التكرار عند إعادة الطلب أو الضغط مرتين)')
+        if (office.subscription_activation?.op_id === opId) {
+          return ok({ success: true, duplicate: true, activation: office.subscription_activation })
+        }
+        if (office.subscription_activation && office.subscription === 'paid') {
+          return bad('الاشتراك معتمد بالفعل لهذا المكتب — التجديد/الترقية تحتاج قراراً صريحاً (لا اعتماد مكرر)', 409)
+        }
+        const pricing = await computePlanPricing(db, planKey)
+        if (pricing.error) return bad(pricing.error)
+        const rahaalT = await getRahaalBookTenantId(db)
+        if (!rahaalT) return bad('دفتر شركة رحّال غير مهيأ (لا Tenant عليه is_platform_org) — يلزم قرار إداري قبل الاعتماد', 500)
+        let clientRes
+        try { clientRes = await ensureOfficeClientAccount(db, rahaalT, office, b.account_name) }
+        catch (e) { return bad(`تعذر إنشاء حساب المكتب في دفتر رحّال: ${e.message}`) }
+        let saleRes
+        try { saleRes = await postSubscriptionSaleJournal(db, rahaalT, { client: clientRes.client, office, amount: pricing.final_total, currency: pricing.currency, opId, actor: sess.user.email }) }
+        catch (e) { return bad(`تعذر إثبات قيد مبيعات الاشتراك: ${e.message}`) }
+        const p = pricing.plan
+        const upd = {
+          plan_tier: planKey, billing_mode: billingMode, subscription: 'paid',
+          // v5.2 — SINGLE conversion gate: the legacy confirm-payment path is retired,
+          // so the activation itself stamps activation_confirmed (idempotent — checked below).
+          activation_confirmed: true, activation_confirmed_at: new Date(),
+          subscription_price: pricing.final_total, subscription_activated_at: new Date(),
+          max_users: Number(p.max_users) === 0 ? null : Number(p.max_users),
+          max_branches: Number(p.max_branches) === 0 ? null : Number(p.max_branches),
+          subscription_activation: {
+            op_id: opId, plan_key: planKey, billing_mode: billingMode,
+            amount: pricing.final_total, currency: pricing.currency, discount_percent: pricing.discount_percent,
+            client_id: clientRes.client.id, account_code: clientRes.client.account_code,
+            je_id: saleRes.je?.id || null, at: new Date(), by: sess.user.email,
+          },
+        }
+        if (billingMode === 'installments') {
+          upd.installments = Array.from({ length: pricing.installments_count }, (_, i) => ({
+            no: i + 1, amount: pricing.per_installment, paid: false, paid_at: null,
+            entries_grant: INSTALLMENT_ENTRIES_GRANT, voucher_id: null,
+          }))
+          upd.unlimited_journals = false // installments: journals open block-by-block (500/قسط)
+        } else {
+          // v5.2 — annual (one-time) payment: the plan's unlimited-journals privilege is
+          // granted HERE (moved from the retired confirm-payment path — post-payment only).
+          if (p.unlimited_journals === true) upd.unlimited_journals = true
+          else if (Number(p.quota_limit) > 0) upd['journal_quota.limit'] = Math.max(Number(p.quota_limit), Number(office.journal_quota?.used) || 0)
+        }
+        await db.collection('tenants').updateOne({ id: office.id }, { $set: upd })
+        if (billingMode === 'installments') await applyInstallmentQuota(db, office.id)
+        // v5.2 — referral bonus moved here from the retired confirm-payment path.
+        // Once-only guard: granted ONLY on the first ever confirmation for this office
+        // (activation_confirmed flag on the PRE-update document) — a retried request or
+        // a re-activation can never grant the +50 twice (نقطة 9).
+        let referrerBonus = null
+        if (office.referred_by && !office.activation_confirmed) {
+          await db.collection('tenants').updateOne(
+            { id: office.referred_by },
+            {
+              $inc: { 'journal_quota.limit': 50, 'referral_stats.activations': 1, 'referral_stats.bonus_earned': 50 },
+              $push: { 'journal_quota.top_ups': { amount: 50, date: new Date(), by: 'referral_activation', referred_tenant: office.id } },
+            }
+          )
+          await db.collection('tenants').updateOne(
+            { id: office.referred_by, 'referral_stats.pending_referrals.referred_tenant': office.id },
+            { $set: { 'referral_stats.pending_referrals.$.paid': true, 'referral_stats.pending_referrals.$.paid_at': new Date() } }
+          )
+          const refT = await db.collection('tenants').findOne({ id: office.referred_by }, { projection: { id: 1, name: 1 } })
+          if (refT) referrerBonus = { referrer_id: refT.id, referrer_name: refT.name, bonus_added: 50 }
+        }
+        return ok({
+          success: true, activation: upd.subscription_activation,
+          account: { id: clientRes.client.id, code: clientRes.client.account_code, name: clientRes.client.name, created: clientRes.created, parent: 'العملاء — دفتر رحّال' },
+          journal: { id: saleRes.je?.id || null, duplicate: saleRes.duplicate },
+          pricing: { final_total: pricing.final_total, currency: pricing.currency, discount_percent: pricing.discount_percent },
+          installments: upd.installments || null,
+          referrer_bonus: referrerBonus,
+        })
       }
 
       // v3.14 → v4.0 — Pricing config management (flexible discount + dynamic features
@@ -2264,14 +2557,16 @@ async function handleRoute(request, { params }) {
         const usersByTenant = {}
         for (const u of users) usersByTenant[u.tenant_id] = (usersByTenant[u.tenant_id] || 0) + 1
         // v3.91 — Phase 2: attach owner info from the SAME users query (zero extra queries)
+        // v5.1 — نقطة 1: full contact data — phone and whatsapp SEPARATELY (whatsapp only
+        // when actually registered) + tenant.owner_phone (signup) as phone fallback.
         const ownersByTenant = {}
-        for (const u of users) if (u.role === 'owner' && u.tenant_id && !ownersByTenant[u.tenant_id]) ownersByTenant[u.tenant_id] = { name: u.name || null, email: u.email || null, phone: u.phone || u.whatsapp || null }
+        for (const u of users) if (u.role === 'owner' && u.tenant_id && !ownersByTenant[u.tenant_id]) ownersByTenant[u.tenant_id] = { name: u.name || null, email: u.email || null, phone: u.phone || null, whatsapp: u.whatsapp || null }
         const [tCount, vCount] = await Promise.all([
           db.collection('tickets').countDocuments(),
           db.collection('visas').countDocuments(),
         ])
         return ok({
-          tenants: tenants.map(t => ({ ...t, _id: undefined, users_count: usersByTenant[t.id] || 0, owner: ownersByTenant[t.id] || null })),
+          tenants: tenants.map(t => ({ ...t, _id: undefined, users_count: usersByTenant[t.id] || 0, owner: ownersByTenant[t.id] ? { ...ownersByTenant[t.id], phone: ownersByTenant[t.id].phone || t.owner_phone || null } : (t.owner_phone ? { name: null, email: null, phone: t.owner_phone, whatsapp: null } : null) })),
           global_stats: { tenants: tenants.length, tickets: tCount, visas: vCount },
         })
       }
@@ -2356,41 +2651,14 @@ async function handleRoute(request, { params }) {
         return ok({ ...tenant, _id: undefined, linked_user: linkMode ? linkUser.email : null })
       }
 
-      // Confirm payment activation (grants +50 to referrer)
+      // v5.2 — RETIRED: the legacy confirm-payment path converted Trial→Paid with ZERO
+      // accounting (no office account, no sale journal). Conversions now flow EXCLUSIVELY
+      // through POST /admin/tenants/:id/subscription-activate — which creates the office
+      // ledger account, posts the sale journal, applies limits/installments, stamps
+      // activation_confirmed AND grants the referral bonus (once-only). NO bypass path.
       const confirmMatch = route.match(/^\/admin\/tenants\/([^/]+)\/confirm-payment$/)
       if (confirmMatch && method === 'POST') {
-        const tid = confirmMatch[1]
-        const t = await db.collection('tenants').findOne({ id: tid })
-        if (!t) return bad('المكتب غير موجود', 404)
-        // v4.0.1 — idempotent: confirm-payment can never run twice for the same office/subscription
-        if (t.activation_confirmed) return bad('تم تأكيد الدفع لهذا المكتب من قبل — لا يمكن تنفيذ العملية مرتين', 409)
-        const confirmSet = { activation_confirmed: true, activation_confirmed_at: new Date(), subscription: 'paid' }
-        // v4.0.1 — the plan's unlimited-journals privilege is granted HERE (post-payment), never before
-        try {
-          const cfgCP = await getPricingConfig(db)
-          const planCP = (cfgCP.plans || []).find(x => x.key === t.plan_tier)
-          if (planCP?.unlimited_journals === true) confirmSet.unlimited_journals = true
-        } catch { }
-        await db.collection('tenants').updateOne({ id: tid }, { $set: confirmSet })
-        let referrerBonus = null
-        if (t.referred_by) {
-          // v3.9 — grant referrer +50 quota ONLY when the referred tenant confirms actual payment
-          await db.collection('tenants').updateOne(
-            { id: t.referred_by },
-            {
-              $inc: { 'journal_quota.limit': 50, 'referral_stats.activations': 1, 'referral_stats.bonus_earned': 50 },
-              $push: { 'journal_quota.top_ups': { amount: 50, date: new Date(), by: 'referral_activation', referred_tenant: tid } }
-            }
-          )
-          // Also mark the pending_referrals entry as paid
-          await db.collection('tenants').updateOne(
-            { id: t.referred_by, 'referral_stats.pending_referrals.referred_tenant': tid },
-            { $set: { 'referral_stats.pending_referrals.$.paid': true, 'referral_stats.pending_referrals.$.paid_at': new Date() } }
-          )
-          const ref = await db.collection('tenants').findOne({ id: t.referred_by })
-          referrerBonus = { referrer_id: ref.id, referrer_name: ref.name, bonus_added: 50 }
-        }
-        return ok({ success: true, referrer_bonus: referrerBonus })
+        return bad('مسار «تأكيد الدفع» القديم أُوقف — التحويل إلى مدفوع يتم حصراً عبر «تفعيل الاشتراك» (يُنشئ حساب المكتب في دفتر رحّال، يثبت قيد مبيعات الاشتراك، ويمنح مكافأة الإحالة تلقائياً)', 410)
       }
 
       const tenantIdMatch = route.match(/^\/admin\/tenants\/([^/]+)$/)
@@ -2421,8 +2689,9 @@ async function handleRoute(request, { params }) {
             const cfg = await getPricingConfig(db)
             const p = (cfg.plans || []).find(x => x.key === b.plan_key)
             if (p) {
-              upd.max_users = Number(p.max_users) === 0 ? 9999 : Number(p.max_users)
-              upd.max_branches = Number(p.max_branches) === 0 ? 9999 : Number(p.max_branches)
+              // v5.0 — unlimited stays UNLIMITED (null), never a fixed 9999 cap (enterprise)
+              upd.max_users = Number(p.max_users) === 0 ? null : Number(p.max_users)
+              upd.max_branches = Number(p.max_branches) === 0 ? null : Number(p.max_branches)
               if (Number(p.quota_limit) > 0) upd['journal_quota.limit'] = Number(p.quota_limit) // v4.0
             }
           }
@@ -2452,7 +2721,15 @@ async function handleRoute(request, { params }) {
           }
           // v3.14 — Manual unlimited-journals toggle (e.g. after final installment is paid)
           if (b.unlimited_journals !== undefined) upd.unlimited_journals = !!b.unlimited_journals
-          if (b.subscription !== undefined) upd.subscription = b.subscription
+          // v5.2 — CONVERSION GUARD: flipping a non-paid office to 'paid' via a plain PATCH
+          // bypasses the accounting gate (no office account, no sale journal). Blocked —
+          // the ONLY conversion path is POST /subscription-activate.
+          if (b.subscription !== undefined) {
+            if (b.subscription === 'paid' && tCur.subscription !== 'paid') {
+              return bad('التحويل إلى «مدفوع» يتم حصراً عبر «تفعيل الاشتراك» (يُنشئ حساب المكتب في دفتر رحّال ويثبت قيد المبيعات) — لا تحويل يدوي يتجاوز المحاسبة', 409)
+            }
+            upd.subscription = b.subscription
+          }
           if (b.subscription_price !== undefined) upd.subscription_price = Number(b.subscription_price) || 0
           if (b.subscription_expires_at !== undefined) upd.subscription_expires_at = b.subscription_expires_at ? new Date(b.subscription_expires_at) : null
           await db.collection('tenants').updateOne({ id: tid }, { $set: upd })
@@ -4217,7 +4494,12 @@ async function handleRoute(request, { params }) {
       // the Super Admin set (plan default or per-office override). Owner counts within it.
       const count = await db.collection('users').countDocuments(tf)
       const maxUsers = sess.tenant.max_users
-      if (maxUsers !== null && maxUsers !== undefined && count >= maxUsers) return bad(`تم الوصول إلى الحد الأقصى للمستخدمين (${maxUsers}). تواصل مع الإدارة لرفع الحد.`)
+      // v5.0 — UNLIMITED semantics: null/undefined = unlimited, and a legacy stored 0
+      // (old "0 = unlimited" enterprise convention) is ALSO unlimited — it is never
+      // interpreted as a zero cap nor converted to a fixed number. Gold/Silver keep
+      // their positive limits exactly as stored.
+      const usersUnlimited = maxUsers === null || maxUsers === undefined || Number(maxUsers) === 0
+      if (!usersUnlimited && count >= Number(maxUsers)) return bad(`تم الوصول إلى الحد الأقصى للمستخدمين (${maxUsers}). تواصل مع الإدارة لرفع الحد.`)
       if (await db.collection('users').findOne({ email: String(b.email).toLowerCase().trim() })) return bad('البريد مستخدم بالفعل')
       const doc = {
         id: uuidv4(), tenant_id: T, email: String(b.email).toLowerCase().trim(), name: b.name,
@@ -4232,6 +4514,25 @@ async function handleRoute(request, { params }) {
       await db.collection('users').insertOne(doc)
       return ok({ id: doc.id, email: doc.email, name: doc.name, role: doc.role, active: doc.active, permissions: doc.permissions, default_box_id: doc.default_box_id, lock_box: doc.lock_box })
     }
+    // v5.1 — نقطة 2: OWNER-side branches inside the office account (same engine as the
+    // admin panel — lib/adminBranches.js). The office that HAS a branch limit (explicit
+    // limit ≥ 1, or enterprise-unlimited) can create branches up to it. Owner-only.
+    const tBrMatch = route.match(/^\/tenant\/branches(?:\/([^/]+))?$/)
+    if (tBrMatch) {
+      if (sess.user.role !== 'owner') return bad('غير مصرح — إدارة الفروع للمالك فقط', 403)
+      const bodyTb = ['POST', 'PUT', 'PATCH'].includes(method) ? await request.json().catch(() => ({})) : null
+      const rTb = await adminBranchesHandler(db, T, tBrMatch[1] || null, method, bodyTb, sess)
+      if (rTb?.error) return bad(rTb.error, rTb.status || 400)
+      return ok(rTb)
+    }
+    const tBrUser = route.match(/^\/tenant\/users\/([^/]+)\/branch$/)
+    if (tBrUser && method === 'PATCH') {
+      if (sess.user.role !== 'owner') return bad('غير مصرح — ربط المستخدمين بالفروع للمالك فقط', 403)
+      const rTu = await adminBranchUserAssignHandler(db, T, tBrUser[1], await request.json().catch(() => ({})))
+      if (rTu?.error) return bad(rTu.error, rTu.status || 400)
+      return ok(rTu)
+    }
+
     const userIdMatch = route.match(/^\/tenant\/users\/([^/]+)$/)
     if (userIdMatch && method === 'PATCH') {
       if (sess.user.role !== 'owner') return bad('غير مصرح', 403)
@@ -4651,7 +4952,7 @@ async function handleRoute(request, { params }) {
     // Verifies PAT works, then routes to createTicket / createVisa based on doc_type.
     if (route === '/scraper/ping' && method === 'GET') {
       // v3.9.7 — Return usage/limit info for trial gating in the extension popup
-      const isPaid = isUnlimitedTenant(sess.tenant)
+      const isPaid = isPaidTenant(sess.tenant) // v5.2 — feature gate: paid installments office keeps full extension access
       const used = sess.tenant?.scraper_usage?.count || 0
       const limit = 30
       return ok({
@@ -4664,7 +4965,7 @@ async function handleRoute(request, { params }) {
     }
     if (route === '/scraper/ingest' && method === 'POST') {
       // v3.9.7 — enforce trial cap (30) for non-paid tenants
-      const isPaidT = isUnlimitedTenant(sess.tenant)
+      const isPaidT = isPaidTenant(sess.tenant) // v5.2 — feature gate (not the journal-quota gate)
       if (!isPaidT) {
         const usedT = sess.tenant?.scraper_usage?.count || 0
         if (usedT >= 30) return cors(NextResponse.json({
@@ -6722,21 +7023,24 @@ async function handleRoute(request, { params }) {
     // Tickets
     // v3.21 — Installment alert for the logged-in tenant (proactive cash-flow reminder)
     if (route === '/my/installment-alert' && method === 'GET') {
+      // v5.1 — نقطة 3: QUOTA-BASED alert (no months, no due dates): when the office has
+      // 100 or fewer journal entries remaining, prompt paying the NEXT unpaid installment.
       const t = await db.collection('tenants').findOne({ id: T })
-      if (!t || t.billing_mode !== 'installments') return ok({ alert: null })
+      if (!t || t.billing_mode !== 'installments' || t.unlimited_journals) return ok({ alert: null })
       const list = Array.isArray(t.installments) ? t.installments : []
       const next = list.find(i => !i.paid) || null
-      if (!next || !next.due_date) return ok({ alert: null })
-      const today = new Date(new Date().toISOString().slice(0, 10))
-      const due = new Date(String(next.due_date).slice(0, 10))
-      const daysLeft = Math.round((due - today) / 86400000)
-      // Alert window: overdue OR due within 10 days
-      if (daysLeft > 10) return ok({ alert: null })
+      if (!next) return ok({ alert: null })
+      const limit = Number(t.journal_quota?.limit) || 0
+      const used = Number(t.journal_quota?.used) || 0
+      const remaining = Math.max(0, limit - used)
+      if (remaining > INSTALLMENT_ALERT_REMAINING) return ok({ alert: null })
       return ok({
         alert: {
-          no: next.no, amount: next.amount, due_date: next.due_date,
-          days_left: daysLeft, overdue: daysLeft < 0,
+          kind: 'quota', remaining, limit, used,
+          no: next.no, amount: next.amount,
+          entries_grant: next.entries_grant || INSTALLMENT_ENTRIES_GRANT,
           paid_count: list.filter(i => i.paid).length, total_count: list.length,
+          exhausted: remaining === 0,
         },
       })
     }
